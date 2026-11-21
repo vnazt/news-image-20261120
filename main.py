@@ -1,1213 +1,724 @@
 #!/usr/bin/env python3
 """The World in One Day - Friday 20 November 2026.
 
-A single front-page image that sums up the world news of Friday
-20 November 2026, drawn entirely by this program: its own PNG
-encoder, its own raster canvas, its own bold bitmap typeface and
-sixteen hand-built scenes (one per major story) plus a regional
-headlines strip.  Pure Python 3.13 standard library, fully
-deterministic: two runs produce byte-identical output.
+Draws a one-page broadsheet that sums up the world news of Friday
+20 November 2026 as a single 1024x1024 PNG: a hero panel for the day's
+biggest story, fifteen drawn story panels and a regional headlines
+strip.  Pure Python 3.13 standard library: its own raster canvas, its
+own bitmap font and its own PNG encoder.  Deterministic - two runs
+produce byte-identical output.  On any drawing failure the bundled
+fallback.png is copied to the output instead.
 """
 
 import os
-import struct
 import zlib
-from math import isqrt, sqrt
 
 W = 1024
 H = 1024
-SS = 2  # supersampling factor; the page is drawn at 2048 and boxed down
 
-INK = (22, 28, 38)
-PAPER = (247, 242, 231)
-CREAM = (255, 246, 224)
+# ---------------------------------------------------------------- palette
+PAPER = (243, 236, 219)
+PAPER_DK = (232, 222, 196)
+INK = (18, 22, 38)
+NAVY = (22, 33, 64)
+NAVY_DK = (13, 20, 42)
+NAVY_LT = (38, 54, 96)
+RED = (196, 38, 42)
+RED_DK = (158, 28, 34)
+GOLD = (233, 178, 45)
+GOLD_DK = (196, 142, 30)
+TEAL = (22, 128, 134)
+TEAL_DK = (14, 84, 94)
+SEA = (26, 96, 110)
+GREEN = (46, 138, 72)
+GREEN_DK = (32, 102, 54)
+LEAF = (64, 166, 84)
+SKY = (168, 204, 228)
+SKY_DK = (120, 164, 200)
+SAND = (232, 205, 150)
+GREY = (118, 122, 132)
+GREY_LT = (178, 182, 190)
+GREY_DK = (74, 78, 88)
+WHITE = (250, 248, 240)
+BROWN = (146, 96, 52)
+ORANGE = (240, 128, 40)
+YELLOW = (250, 208, 74)
 
 
-def mix(c1, c2, t):
-    return (int(c1[0] + (c2[0] - c1[0]) * t + 0.5),
-            int(c1[1] + (c2[1] - c1[1]) * t + 0.5),
-            int(c1[2] + (c2[2] - c1[2]) * t + 0.5))
+# ---------------------------------------------------------------- canvas
+class Canvas:
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.px = bytearray(bg) * (w * h)
+        self.clip = (0, 0, w, h)
+
+    def set_clip(self, x, y, w, h):
+        self.clip = (max(0, x), max(0, y), min(self.w, x + w), min(self.h, y + h))
+
+    def reset_clip(self):
+        self.clip = (0, 0, self.w, self.h)
+
+    def set(self, x, y, c):
+        cx0, cy0, cx1, cy1 = self.clip
+        if cx0 <= x < cx1 and cy0 <= y < cy1:
+            i = (y * self.w + x) * 3
+            self.px[i] = c[0]
+            self.px[i + 1] = c[1]
+            self.px[i + 2] = c[2]
+
+    def rect(self, x, y, w, h, c):
+        cx0, cy0, cx1, cy1 = self.clip
+        x0 = max(x, cx0)
+        y0 = max(y, cy0)
+        x1 = min(x + w, cx1)
+        y1 = min(y + h, cy1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        row = bytes(c) * (x1 - x0)
+        n = (x1 - x0) * 3
+        for yy in range(y0, y1):
+            i = (yy * self.w + x0) * 3
+            self.px[i:i + n] = row
+
+    def rect_outline(self, x, y, w, h, c, t=2):
+        self.rect(x, y, w, t, c)
+        self.rect(x, y + h - t, w, t, c)
+        self.rect(x, y, t, h, c)
+        self.rect(x + w - t, y, t, h, c)
+
+    def circle(self, cx, cy, r, c):
+        r2 = r * r
+        for yy in range(cy - r, cy + r + 1):
+            dy = yy - cy
+            for xx in range(cx - r, cx + r + 1):
+                dx = xx - cx
+                if dx * dx + dy * dy <= r2:
+                    self.set(xx, yy, c)
+
+    def ring(self, cx, cy, r, t, c):
+        ro = r + t
+        ro2 = ro * ro
+        ri2 = r * r
+        for yy in range(cy - ro, cy + ro + 1):
+            dy = yy - cy
+            for xx in range(cx - ro, cx + ro + 1):
+                dx = xx - cx
+                d2 = dx * dx + dy * dy
+                if ri2 < d2 <= ro2:
+                    self.set(xx, yy, c)
+
+    def ellipse(self, cx, cy, rx, ry, c):
+        if rx <= 0 or ry <= 0:
+            return
+        for yy in range(cy - ry, cy + ry + 1):
+            dy = (yy - cy) / ry
+            for xx in range(cx - rx, cx + rx + 1):
+                dx = (xx - cx) / rx
+                if dx * dx + dy * dy <= 1.0:
+                    self.set(xx, yy, c)
+
+    def line(self, x0, y0, x1, y1, c, t=2):
+        steps = max(abs(x1 - x0), abs(y1 - y0), 1)
+        r = max(0, t // 2)
+        for i in range(steps + 1):
+            x = x0 + (x1 - x0) * i // steps
+            y = y0 + (y1 - y0) * i // steps
+            if r == 0:
+                self.set(x, y, c)
+            else:
+                self.circle(x, y, r, c)
+
+    def poly(self, pts, c):
+        ys = [p[1] for p in pts]
+        y0 = max(min(ys), self.clip[1])
+        y1 = min(max(ys), self.clip[3] - 1)
+        n = len(pts)
+        for yy in range(y0, y1 + 1):
+            nodes = []
+            for i in range(n):
+                xa, ya = pts[i]
+                xb, yb = pts[(i + 1) % n]
+                if (ya <= yy < yb) or (yb <= yy < ya):
+                    nodes.append(xa + (yy - ya) * (xb - xa) // (yb - ya))
+            nodes.sort()
+            for i in range(0, len(nodes) - 1, 2):
+                self.rect(nodes[i], yy, nodes[i + 1] - nodes[i] + 1, 1, c)
 
 
-class Rng:
-    """Tiny deterministic LCG so star fields and window lights are stable."""
+# ---------------------------------------------------------------- png out
+def encode_png(cv):
+    w, h = cv.w, cv.h
+    raw = bytearray()
+    prev = bytearray(w * 3)
+    px = cv.px
+    for y in range(h):
+        row = bytes(px[y * w * 3:(y + 1) * w * 3])
+        best = None
+        for ftype in (0, 1, 2):
+            if ftype == 0:
+                data = row
+            elif ftype == 1:
+                data = bytearray(len(row))
+                for i in range(len(row)):
+                    left = row[i - 3] if i >= 3 else 0
+                    data[i] = (row[i] - left) & 0xFF
+                data = bytes(data)
+            else:
+                data = bytes((row[i] - prev[i]) & 0xFF for i in range(len(row)))
+            score = sum(b if b < 128 else 256 - b for b in data[::7])
+            if best is None or score < best[0]:
+                best = (score, ftype, data)
+        raw.append(best[1])
+        raw.extend(best[2])
+        prev = bytearray(row)
 
-    def __init__(self, seed):
-        self.s = (seed & 0x7FFFFFFF) or 1
+    def chunk(tag, data):
+        out = len(data).to_bytes(4, "big") + tag + data
+        return out + zlib.crc32(tag + data).to_bytes(4, "big")
 
-    def next(self):
-        self.s = (self.s * 1103515245 + 12345) & 0x7FFFFFFF
-        return self.s
-
-    def range(self, lo, hi):
-        return lo + self.next() % max(1, hi - lo)
-
-    def frac(self):
-        return self.next() / 2147483648.0
+    ihdr = w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
 
 
-# --------------------------------------------------------------------------
-# Bold 7x9 bitmap typeface, drawn by hand for this page.
-# --------------------------------------------------------------------------
-
-_FONT_RAW = {
-    'A': (".#####.", "##...##", "##...##", "##...##", "#######",
-          "##...##", "##...##", "##...##", "##...##"),
-    'B': ("######.", "##...##", "##...##", "##...##", "######.",
-          "##...##", "##...##", "##...##", "######."),
-    'C': (".#####.", "##...##", "##.....", "##.....", "##.....",
-          "##.....", "##.....", "##...##", ".#####."),
-    'D': ("######.", "##...##", "##...##", "##...##", "##...##",
-          "##...##", "##...##", "##...##", "######."),
-    'E': ("#######", "##.....", "##.....", "##.....", "######.",
-          "##.....", "##.....", "##.....", "#######"),
-    'F': ("#######", "##.....", "##.....", "##.....", "######.",
-          "##.....", "##.....", "##.....", "##....."),
-    'G': (".#####.", "##...##", "##.....", "##.....", "##..###",
-          "##...##", "##...##", "##...##", ".#####."),
-    'H': ("##...##", "##...##", "##...##", "##...##", "#######",
-          "##...##", "##...##", "##...##", "##...##"),
-    'I': ("#######", "...##..", "...##..", "...##..", "...##..",
-          "...##..", "...##..", "...##..", "#######"),
-    'J': ("#######", ".....##", ".....##", ".....##", ".....##",
-          ".....##", ".....##", "##..##.", ".####.."),
-    'K': ("##...##", "##..##.", "##.##..", "##.##..", "####...",
-          "##.##..", "##..##.", "##..##.", "##...##"),
-    'L': ("##.....", "##.....", "##.....", "##.....", "##.....",
-          "##.....", "##.....", "##.....", "#######"),
-    'M': ("##...##", "###.###", "##.#.##", "##.#.##", "##...##",
-          "##...##", "##...##", "##...##", "##...##"),
-    'N': ("##...##", "##...##", "###..##", "##.#.##", "##..###",
-          "##...##", "##...##", "##...##", "##...##"),
-    'O': (".#####.", "##...##", "##...##", "##...##", "##...##",
-          "##...##", "##...##", "##...##", ".#####."),
-    'P': ("######.", "##...##", "##...##", "##...##", "######.",
-          "##.....", "##.....", "##.....", "##....."),
-    'Q': (".#####.", "##...##", "##...##", "##...##", "##...##",
-          "##.#.##", "##..##.", ".#####.", "....###"),
-    'R': ("######.", "##...##", "##...##", "##...##", "######.",
-          "##.##..", "##..##.", "##..##.", "##...##"),
-    'S': (".######", "##.....", "##.....", "##.....", ".#####.",
-          ".....##", ".....##", ".....##", "######."),
-    'T': ("#######", "#######", "...##..", "...##..", "...##..",
-          "...##..", "...##..", "...##..", "...##.."),
-    'U': ("##...##", "##...##", "##...##", "##...##", "##...##",
-          "##...##", "##...##", "##...##", ".#####."),
-    'V': ("##...##", "##...##", "##...##", "##...##", "##...##",
-          "##...##", ".##.##.", ".##.##.", "..###.."),
-    'W': ("##...##", "##...##", "##...##", "##...##", "##...##",
-          "##.#.##", "##.#.##", "###.###", "##...##"),
-    'X': ("##...##", ".##.##.", ".##.##.", "..###..", "..###..",
-          ".##.##.", ".##.##.", "##...##", "##...##"),
-    'Y': ("##...##", "##...##", ".##.##.", ".##.##.", "..###..",
-          "...##..", "...##..", "...##..", "...##.."),
-    'Z': ("#######", "#######", ".....##", "....##.", "...##..",
-          "..##...", ".##....", "##.....", "#######"),
-    '0': (".#####.", "##...##", "##...##", "##..###", "##.#.##",
-          "###..##", "##...##", "##...##", ".#####."),
-    '1': ("..##...", ".###...", ".###...", "..##...", "..##...",
-          "..##...", "..##...", "..##...", "#######"),
-    '2': (".#####.", "##...##", "##...##", ".....##", "....##.",
-          "...##..", "..##...", ".##....", "#######"),
-    '3': (".#####.", "##...##", ".....##", "..####.", ".....##",
-          ".....##", ".....##", "##...##", ".#####."),
-    '4': ("....##.", "...###.", "...###.", "..##.##", "..##.##",
-          "#######", ".....##", ".....##", ".....##"),
-    '5': ("#######", "##.....", "##.....", "######.", ".....##",
-          ".....##", ".....##", "##...##", ".#####."),
-    '6': (".#####.", "##...##", "##.....", "######.", "##...##",
-          "##...##", "##...##", "##...##", ".#####."),
-    '7': ("#######", "#######", ".....##", "....##.", "....##.",
-          "...##..", "...##..", "...##..", "...##.."),
-    '8': (".#####.", "##...##", "##...##", ".#####.", "##...##",
-          "##...##", "##...##", "##...##", ".#####."),
-    '9': (".#####.", "##...##", "##...##", "##...##", ".######",
-          ".....##", ".....##", "##...##", ".#####."),
-    ' ': (".......",) * 9,
-    '.': (".......", ".......", ".......", ".......", ".......",
-          ".......", ".......", "..##...", "..##..."),
-    ',': (".......", ".......", ".......", ".......", ".......",
-          ".......", ".......", "..##...", ".##...."),
-    ':': (".......", ".......", "..##...", "..##...", ".......",
-          ".......", "..##...", "..##...", "......."),
-    ';': (".......", ".......", "..##...", "..##...", ".......",
-          ".......", "..##...", ".##....", "......."),
-    '!': ("...##..", "...##..", "...##..", "...##..", "...##..",
-          "...##..", ".......", "...##..", "...##.."),
-    '?': (".#####.", "##...##", ".....##", "....##.", "...##..",
-          "...##..", ".......", "...##..", "...##.."),
-    "'": ("...##..", "...##..", ".......", ".......", ".......",
-          ".......", ".......", ".......", "......."),
-    '-': (".......", ".......", ".......", ".#####.", ".#####.",
-          ".......", ".......", ".......", "......."),
-    '+': (".......", ".......", "...##..", "...##..", ".#####.",
-          "...##..", "...##..", ".......", "......."),
-    '/': (".....##", ".....##", "....##.", "....##.", "...##..",
-          "...##..", "..##...", "..##...", ".##...."),
-    '&': (".#####.", "##...##", "##..##.", ".####..", "..##...",
-          ".##.##.", "##..##.", "##...##", ".###.##"),
-    '%': ("##...##", "##..##.", "....##.", "...##..", "..##...",
-          "..##...", ".##....", "##..##.", "##...##"),
-    '(': ("....##.", "...##..", "..##...", "..##...", "..##...",
-          "..##...", "..##...", "...##..", "....##."),
-    ')': (".##....", "..##...", "...##..", "...##..", "...##..",
-          "...##..", "...##..", "..##...", ".##...."),
-    '·': (".......", ".......", ".......", "..##...", "..##...",
-          ".......", ".......", ".......", "......."),
-    '"': (".##.##.", ".##.##.", ".......", ".......", ".......",
-          ".......", ".......", ".......", "......."),
-    '*': (".......", ".......", ".##.##.", "..###..", "#######",
-          "..###..", ".##.##.", ".......", "......."),
-    '=': (".......", ".......", ".#####.", ".#####.", ".......",
-          ".#####.", ".#####.", ".......", "......."),
-    '$': ("...##..", ".######", "##.##..", "##.##..", ".#####.",
-          "..#.##.", "..#.##.", "######.", "...##.."),
-    '#': (".......", ".##.##.", ".##.##.", "#######", ".##.##.",
-          "#######", ".##.##.", ".##.##.", "......."),
+# ---------------------------------------------------------------- font
+# 5x7 bitmap glyphs, rows top to bottom, '1' = ink.
+FONT = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
+    "D": ("11100", "10010", "10001", "10001", "10001", "10010", "11100"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
+    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "01010", "00100", "00100", "00100", "01010", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+    ".": ("00000", "00000", "00000", "00000", "00000", "01100", "01100"),
+    ",": ("00000", "00000", "00000", "00000", "01100", "00100", "01000"),
+    ":": ("00000", "01100", "01100", "00000", "01100", "01100", "00000"),
+    "'": ("00100", "00100", "01000", "00000", "00000", "00000", "00000"),
+    "-": ("00000", "00000", "00000", "01110", "00000", "00000", "00000"),
+    "+": ("00000", "00100", "00100", "01110", "00100", "00100", "00000"),
+    "/": ("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
+    "?": ("01110", "10001", "00001", "00100", "00100", "00000", "00100"),
+    "!": ("00100", "00100", "00100", "00100", "00100", "00000", "00100"),
+    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+    "\u00b7": ("00000", "00000", "00000", "01100", "01100", "00000", "00000"),
 }
 
 
-def _norm_font(raw):
-    out = {}
-    for ch, rows in raw.items():
-        fixed = []
-        for r in list(rows)[:9]:
-            fixed.append((r + ".......")[:7])
-        while len(fixed) < 9:
-            fixed.append(".......")
-        out[ch] = tuple(fixed)
-    return out
+def text_width(s, scale, tracking=1, bold=False):
+    if not s:
+        return 0
+    adv = (5 + tracking) * scale
+    w = len(s) * adv - tracking * scale
+    if bold:
+        w += max(1, scale // 2)
+    return w
 
 
-FONT = _norm_font(_FONT_RAW)
+def draw_text(cv, x, y, s, scale, color, tracking=1, bold=False):
+    adv = (5 + tracking) * scale
+    extra = max(1, scale // 2) if bold else 0
+    for ch in s.upper():
+        glyph = FONT.get(ch, FONT[" "])
+        for gy, row in enumerate(glyph):
+            for gx, bit in enumerate(row):
+                if bit == "1":
+                    cv.rect(x + gx * scale, y + gy * scale, scale, scale, color)
+                    if extra:
+                        cv.rect(x + gx * scale + extra, y + gy * scale,
+                                scale, scale, color)
+        x += adv
+    return x
 
 
-# --------------------------------------------------------------------------
-# Raster canvas (supersampled) and PNG encoder.
-# --------------------------------------------------------------------------
-
-class Canvas:
-    def __init__(self, w, h, ss):
-        self.ss = ss
-        self.w = w * ss
-        self.h = h * ss
-        self.px = bytearray(self.w * self.h * 3)
-
-    # -- low level ------------------------------------------------------
-    def _span(self, y, x0, x1, c):
-        if y < 0 or y >= self.h or x1 <= x0:
-            return
-        if x0 < 0:
-            x0 = 0
-        if x1 > self.w:
-            x1 = self.w
-        if x1 <= x0:
-            return
-        off = (y * self.w + x0) * 3
-        self.px[off:off + (x1 - x0) * 3] = bytes(c) * (x1 - x0)
-
-    def _ss(self, v):
-        return int(round(v * self.ss))
-
-    # -- shapes (final-page coordinates) --------------------------------
-    def fill_rect(self, x, y, w, h, c):
-        x0, x1 = self._ss(x), self._ss(x + w)
-        y0, y1 = self._ss(y), self._ss(y + h)
-        for yy in range(y0, y1):
-            self._span(yy, x0, x1, c)
-
-    def rect_outline(self, x, y, w, h, c, t=2.0):
-        self.fill_rect(x, y, w, t, c)
-        self.fill_rect(x, y + h - t, w, t, c)
-        self.fill_rect(x, y, t, h, c)
-        self.fill_rect(x + w - t, y, t, h, c)
-
-    def vgrad(self, x, y, w, h, c1, c2):
-        x0, x1 = self._ss(x), self._ss(x + w)
-        y0, y1 = self._ss(y), self._ss(y + h)
-        span = max(1, y1 - y0 - 1)
-        for yy in range(y0, y1):
-            self._span(yy, x0, x1, mix(c1, c2, (yy - y0) / span))
-
-    def circle(self, cx, cy, r, c):
-        cx, cy, r = self._ss(cx), self._ss(cy), max(1, self._ss(r))
-        for dy in range(-r, r + 1):
-            hw = isqrt(r * r - dy * dy)
-            self._span(cy + dy, cx - hw, cx + hw + 1, c)
-
-    def ellipse(self, cx, cy, rx, ry, c):
-        cx, cy = self._ss(cx), self._ss(cy)
-        rx, ry = max(1, self._ss(rx)), max(1, self._ss(ry))
-        for dy in range(-ry, ry + 1):
-            hw = int(rx * sqrt(max(0.0, 1.0 - (dy / ry) ** 2)))
-            self._span(cy + dy, cx - hw, cx + hw + 1, c)
-
-    def ring(self, cx, cy, r, t, c):
-        cx, cy = self._ss(cx), self._ss(cy)
-        ro = max(1, self._ss(r))
-        ri = max(0, self._ss(r - t))
-        for dy in range(-ro, ro + 1):
-            hwo = isqrt(ro * ro - dy * dy)
-            if abs(dy) < ri:
-                hwi = isqrt(ri * ri - dy * dy)
-                self._span(cy + dy, cx - hwo, cx - hwi, c)
-                self._span(cy + dy, cx + hwi, cx + hwo + 1, c)
-            else:
-                self._span(cy + dy, cx - hwo, cx + hwo + 1, c)
-
-    def ellipse_ring(self, cx, cy, rx, ry, t, c):
-        cx, cy = self._ss(cx), self._ss(cy)
-        rxo, ryo = max(1, self._ss(rx)), max(1, self._ss(ry))
-        rxi, ryi = max(0, self._ss(rx - t)), max(0, self._ss(ry - t))
-        for dy in range(-ryo, ryo + 1):
-            hwo = int(rxo * sqrt(max(0.0, 1.0 - (dy / ryo) ** 2)))
-            if ryi > 0 and abs(dy) < ryi:
-                hwi = int(rxi * sqrt(max(0.0, 1.0 - (dy / ryi) ** 2)))
-                self._span(cy + dy, cx - hwo, cx - hwi, c)
-                self._span(cy + dy, cx + hwi, cx + hwo + 1, c)
-            else:
-                self._span(cy + dy, cx - hwo, cx + hwo + 1, c)
-
-    def line(self, x0, y0, x1, y1, c, wdt=2.0, dash=None):
-        dx, dy = x1 - x0, y1 - y0
-        dist = sqrt(dx * dx + dy * dy)
-        step = max(0.7, wdt * 0.38)
-        n = int(dist / step) + 1
-        for i in range(n + 1):
-            if dash is not None:
-                on, off = dash
-                if (i % (on + off)) >= on:
-                    continue
-            t = i / n if n else 0.0
-            self.circle(x0 + dx * t, y0 + dy * t, wdt / 2.0, c)
-
-    def poly(self, pts, c):
-        sp = [(self._ss(px), self._ss(py)) for px, py in pts]
-        ys = [p[1] for p in sp]
-        y0, y1 = max(0, min(ys)), min(self.h - 1, max(ys))
-        n = len(sp)
-        for yy in range(y0, y1 + 1):
-            yc = yy + 0.5
-            xs = []
-            for i in range(n):
-                xa, ya = sp[i]
-                xb, yb = sp[(i + 1) % n]
-                if (ya <= yc < yb) or (yb <= yc < ya):
-                    xs.append(xa + (yc - ya) * (xb - xa) / (yb - ya))
-            xs.sort()
-            for i in range(0, len(xs) - 1, 2):
-                self._span(yy, int(xs[i]), int(xs[i + 1]) + 1, c)
-
-    # -- text -------------------------------------------------------------
-    def text_w(self, s, size, condense=0.92, tracking=1.0):
-        if not s:
-            return 0.0
-        ux = size / 9.0 * condense
-        adv = 8.3 * ux * tracking
-        return adv * len(s) - (adv - 7 * ux)
-
-    def text(self, x, y, s, size, color, align='l', condense=0.92,
-             tracking=1.0):
-        s = s.upper()
-        uy = size / 9.0
-        ux = uy * condense
-        adv = 8.3 * ux * tracking
-        wtot = self.text_w(s, size, condense, tracking)
-        if align == 'c':
-            x -= wtot / 2.0
-        elif align == 'r':
-            x -= wtot
-        cx = x
-        for ch in s:
-            g = FONT.get(ch, FONT[' '])
-            for r in range(9):
-                row = g[r]
-                for ci in range(7):
-                    if row[ci] == '#':
-                        self.fill_rect(cx + ci * ux, y + r * uy,
-                                       ux * 1.09, uy * 1.09, color)
-            cx += adv
-        return wtot
-
-    def fit_size(self, s, maxw, maxsize, condense=0.92, tracking=1.0):
-        w1 = self.text_w(s, 1.0, condense, tracking)
-        if w1 <= 0:
-            return maxsize
-        return min(maxsize, maxw / w1)
-
-    # -- output -----------------------------------------------------------
-    def downscale(self):
-        """Box-average the supersampled buffer down to final size."""
-        ss = self.ss
-        w = self.w // ss
-        h = self.h // ss
-        src = self.px
-        sw3 = self.w * 3
-        out = bytearray(w * h * 3)
-
-        def avg2(b):
-            return bytes([(a + b) >> 1
-                          for a, b in zip(b[0::2], b[1::2])])
-
-        for oy in range(h):
-            rows = []
-            for k in range(ss):
-                base = (oy * ss + k) * sw3
-                chans = []
-                for c in range(3):
-                    chans.append(avg2(bytes(src[base + c:base + sw3:3])))
-                rows.append(chans)
-            orow = oy * w * 3
-            for c in range(3):
-                if ss == 2:
-                    merged = bytes([(a + b) >> 1 for a, b in
-                                    zip(rows[0][c], rows[1][c])])
-                else:
-                    merged = rows[0][c]
-                out[orow + c:orow + w * 3:3] = merged
-        return bytes(out), w, h
+def draw_text_centered(cv, cx, y, s, scale, color, tracking=1, bold=False):
+    w = text_width(s, scale, tracking, bold)
+    return draw_text(cv, cx - w // 2, y, s, scale, color, tracking, bold)
 
 
-def _png_chunk(tag, data):
-    return (struct.pack(">I", len(data)) + tag + data +
-            struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+# ---------------------------------------------------------------- hero
+def draw_hero(cv, x, y, w, h):
+    cv.set_clip(x, y, w, h)
+    cv.rect(x, y, w, h, NAVY)
+    base = y + 196  # skyline baseline / river top
+    # skyline silhouette with lit windows
+    widths = [64, 48, 80, 56, 72, 44, 88, 60, 52, 76, 68, 58, 84, 50, 70, 62]
+    heights = [92, 130, 76, 148, 104, 168, 88, 140, 118, 158, 96, 136, 110, 150, 84, 122]
+    bx = x + 6
+    for bi, (bw, bh) in enumerate(zip(widths, heights)):
+        if bx + bw > x + w - 4:
+            break
+        top = base - bh
+        cv.rect(bx, top, bw, bh, NAVY_DK)
+        for wy in range(top + 8, base - 10, 13):
+            for wx in range(bx + 6, bx + bw - 8, 11):
+                if (bi * 13 + (wx // 11) * 7 + (wy // 13) * 3) % 5 < 2:
+                    cv.rect(wx, wy, 4, 5, GOLD)
+        bx += bw + 4
+    # smoke puffs over two rooftops
+    for cx, cy, r in ((x + 250, y + 148, 15), (x + 266, y + 140, 11),
+                      (x + 236, y + 142, 9), (x + 606, y + 138, 13),
+                      (x + 620, y + 131, 9)):
+        cv.circle(cx, cy, r, GREY)
+    cv.circle(x + 254, y + 144, 8, GREY_DK)
+    cv.circle(x + 610, y + 134, 6, GREY_DK)
+    # river with reflection dashes
+    cv.rect(x, base, w, h - 196, SEA)
+    for ry, step, off in ((base + 14, 46, 0), (base + 27, 58, 22), (base + 40, 52, 8)):
+        for rx in range(x + 18 + off, x + w - 30, step):
+            cv.rect(rx, ry, 16, 3, TEAL)
+            cv.rect(rx + 22, ry, 7, 3, GOLD_DK)
+    # cable bridge
+    deck_y = y + 186
+    cv.rect(x + 30, deck_y, w - 60, 6, GREY_LT)
+    for px in (x + 300, x + 644):
+        cv.rect(px, y + 96, 9, deck_y - (y + 96) + 6, GREY_LT)
+        for dx in (-160, -96, -32, 32, 96, 160):
+            cv.line(px + 4, y + 100, px + 4 + dx, deck_y, GREY, 2)
+    # missile trails with burst heads
+    trails = [((60, 0), (170, 96)), ((250, 0), (356, 64)), ((470, 0), (540, 110)),
+              ((640, 0), (716, 58)), ((920, 0), (862, 100))]
+    for (sx, sy), (ex, ey) in trails:
+        cv.line(x + sx, y + sy, x + ex, y + ey, GREY, 6)
+        cv.line(x + sx, y + sy, x + ex, y + ey, WHITE, 2)
+    for ex, ey in ((170, 96), (356, 64), (540, 110), (716, 58), (862, 100)):
+        cv.circle(x + ex, y + ey, 17, ORANGE)
+        cv.circle(x + ex, y + ey, 12, YELLOW)
+        cv.circle(x + ex, y + ey, 6, WHITE)
+    # drones
+    for dx, dy in ((452, 36), (788, 30), (96, 44)):
+        cv.line(x + dx - 9, y + dy - 9, x + dx + 9, y + dy + 9, GREY_LT, 3)
+        cv.line(x + dx - 9, y + dy + 9, x + dx + 9, y + dy - 9, GREY_LT, 3)
+        cv.circle(x + dx, y + dy, 3, RED)
+    cv.reset_clip()
 
 
-def _filter_rows(raw, w, h, bpp):
-    stride = w * bpp
-    out = bytearray()
-    prev = bytes(stride)
-    for yy in range(h):
-        row = raw[yy * stride:(yy + 1) * stride]
-        cands = [b"\x00" + row]
-        sub = bytearray(stride)
-        for i in range(stride):
-            left = row[i - bpp] if i >= bpp else 0
-            sub[i] = (row[i] - left) & 0xFF
-        cands.append(b"\x01" + bytes(sub))
-        up = bytearray(stride)
-        for i in range(stride):
-            up[i] = (row[i] - prev[i]) & 0xFF
-        cands.append(b"\x02" + bytes(up))
-
-        def sad(cand):
-            return sum(b if b < 128 else 256 - b for b in cand[1:])
-
-        out += min(cands, key=sad)
-        prev = row
-    return bytes(out)
+# ---------------------------------------------------------------- panels
+def scene_peace(cv, x, y):
+    cv.rect(x, y, 180, 46, SKY)
+    cv.rect(x, y + 46, 180, 24, PAPER_DK)
+    for fx, fc in ((10, RED), (80, NAVY), (150, GOLD)):
+        cv.rect(x + fx, y + 5, 20, 13, fc)
+        cv.rect(x + fx + 9, y + 18, 2, 9, INK)
+    cv.ellipse(x + 90, y + 57, 42, 9, BROWN)
+    cv.rect(x + 86, y + 60, 8, 7, BROWN)
+    cv.poly([(x + 64, y + 25), (x + 88, y + 9), (x + 99, y + 25)], WHITE)
+    cv.ellipse(x + 90, y + 27, 25, 10, WHITE)
+    cv.poly([(x + 68, y + 30), (x + 54, y + 38), (x + 70, y + 36)], WHITE)
+    cv.circle(x + 112, y + 21, 6, WHITE)
+    cv.poly([(x + 116, y + 21), (x + 125, y + 23), (x + 116, y + 26)], GOLD)
 
 
-def encode_png(rgb, w, h):
-    """RGB PNG; falls back to a fixed 256-colour palette if oversized."""
-    data = _filter_rows(rgb, w, h, 3)
-    png = (b"\x89PNG\r\n\x1a\n" +
-           _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
-           _png_chunk(b"IDAT", zlib.compress(data, 9)) +
-           _png_chunk(b"IEND", b""))
-    if len(png) <= 1048576:
-        return png
-    # Deterministic uniform 3-3-2 palette quantisation.
-    idx = bytearray(w * h)
-    for i in range(w * h):
-        r, g, b = rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]
-        idx[i] = ((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6)
-    pal = bytearray()
-    for i in range(256):
-        pal += bytes((((i >> 5) & 7) * 255 // 7,
-                      ((i >> 2) & 7) * 255 // 7,
-                      (i & 3) * 255 // 3))
-    data = _filter_rows(bytes(idx), w, h, 1)
-    return (b"\x89PNG\r\n\x1a\n" +
-            _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 3, 0, 0, 0)) +
-            _png_chunk(b"PLTE", bytes(pal)) +
-            _png_chunk(b"IDAT", zlib.compress(data, 9)) +
-            _png_chunk(b"IEND", b""))
+def scene_court(cv, x, y):
+    cv.rect(x, y, 180, 56, SKY)
+    cv.rect(x, y + 56, 180, 14, PAPER_DK)
+    cv.poly([(x + 30, y + 18), (x + 150, y + 18), (x + 90, y + 5)], WHITE)
+    cv.rect(x + 28, y + 19, 124, 6, WHITE)
+    for cx in (40, 68, 104, 132):
+        cv.rect(x + cx, y + 27, 9, 26, WHITE)
+    cv.rect(x + 26, y + 53, 128, 5, WHITE)
+    cv.line(x + 90, y + 30, x + 90, y + 55, GOLD_DK, 3)
+    cv.line(x + 68, y + 32, x + 112, y + 32, GOLD_DK, 3)
+    cv.line(x + 68, y + 32, x + 68, y + 41, GOLD_DK, 2)
+    cv.line(x + 112, y + 32, x + 112, y + 41, GOLD_DK, 2)
+    cv.ellipse(x + 68, y + 43, 11, 3, GOLD)
+    cv.ellipse(x + 112, y + 43, 11, 3, GOLD)
+    cv.circle(x + 90, y + 27, 3, GOLD_DK)
 
 
-# --------------------------------------------------------------------------
-# Scene building blocks.
-# --------------------------------------------------------------------------
-
-from math import cos, sin, pi
-
-
-def cloud(cv, cx, cy, s, c):
-    cv.circle(cx, cy, s, c)
-    cv.circle(cx - s * 0.95, cy + s * 0.18, s * 0.68, c)
-    cv.circle(cx + s * 0.95, cy + s * 0.18, s * 0.74, c)
-    cv.circle(cx + s * 0.25, cy - s * 0.38, s * 0.62, c)
-
-
-def sparkle(cv, cx, cy, s, c):
-    cv.line(cx - s, cy, cx + s, cy, c, 1.8)
-    cv.line(cx, cy - s, cx, cy + s, c, 1.8)
-    cv.circle(cx, cy, s * 0.22, c)
+def scene_markets(cv, x, y):
+    cv.rect(x, y, 180, 70, NAVY)
+    cv.circle(x + 50, y + 33, 23, TEAL)
+    cv.circle(x + 42, y + 25, 7, LEAF)
+    cv.circle(x + 60, y + 42, 6, LEAF)
+    cv.circle(x + 38, y + 44, 5, LEAF)
+    cv.circle(x + 58, y + 20, 4, LEAF)
+    pts = [(16, 12), (58, 20), (90, 15), (122, 32), (158, 54)]
+    for i in range(len(pts) - 1):
+        cv.line(x + pts[i][0], y + pts[i][1], x + pts[i + 1][0], y + pts[i + 1][1], RED, 5)
+    cv.poly([(x + 146, y + 46), (x + 168, y + 62), (x + 170, y + 42)], RED)
+    for cx, cy, ch, cc in ((86, 52, 13, GREEN), (104, 57, 9, RED), (122, 50, 15, GREEN)):
+        cv.line(x + cx + 4, y + cy - 3, x + cx + 4, y + cy + ch + 3, cc, 2)
+        cv.rect(x + cx, y + cy, 8, ch, cc)
 
 
-def star5(cv, cx, cy, r, c):
-    pts = []
-    for i in range(10):
-        rr = r if i % 2 == 0 else r * 0.45
-        a = -pi / 2 + i * pi / 5
-        pts.append((cx + cos(a) * rr, cy + sin(a) * rr))
-    cv.poly(pts, c)
+def scene_ipo(cv, x, y):
+    cv.rect(x, y, 180, 70, SKY)
+    cv.circle(x + 44, y + 20, 13, GOLD)
+    cv.poly([(x + 30, y + 24), (x + 58, y + 24), (x + 65, y + 38), (x + 23, y + 38)], GOLD)
+    cv.rect(x + 23, y + 38, 42, 4, GOLD_DK)
+    cv.circle(x + 44, y + 45, 4, GOLD_DK)
+    pts = [(14, 60), (50, 55), (84, 22), (108, 13)]
+    for i in range(len(pts) - 1):
+        cv.line(x + pts[i][0], y + pts[i][1], x + pts[i + 1][0], y + pts[i + 1][1], GREEN_DK, 4)
+    pts2 = [(108, 13), (132, 25), (160, 49)]
+    for i in range(len(pts2) - 1):
+        cv.line(x + pts2[i][0], y + pts2[i][1], x + pts2[i + 1][0], y + pts2[i + 1][1], RED, 4)
+    cv.poly([(x + 148, y + 42), (x + 168, y + 56), (x + 170, y + 38)], RED)
+    cv.circle(x + 108, y + 13, 4, YELLOW)
+    cv.ring(x + 108, y + 13, 5, 1, INK)
 
 
-def burst(cv, cx, cy, r):
-    for k in range(8):
-        a = k * pi / 4 + 0.39
-        cv.line(cx, cy, cx + cos(a) * r * 1.3, cy + sin(a) * r * 1.3,
-                (250, 170, 70), max(1.4, r * 0.14))
-    cv.circle(cx, cy, r, (216, 64, 32))
-    cv.circle(cx, cy, r * 0.76, (242, 122, 38))
-    cv.circle(cx, cy, r * 0.54, (252, 182, 62))
-    cv.circle(cx, cy, r * 0.33, (255, 232, 166))
-    cv.circle(cx, cy, r * 0.17, (255, 252, 240))
+def scene_kerch(cv, x, y):
+    cv.rect(x, y, 180, 40, SKY)
+    cv.rect(x, y + 40, 180, 30, SEA)
+    cv.rect(x, y + 33, 30, 10, GREY_DK)
+    cv.rect(x, y + 35, 82, 5, GREY_DK)
+    cv.line(x + 80, y + 38, x + 128, y + 57, GREY_DK, 7)
+    cv.line(x + 128, y + 57, x + 138, y + 67, GREY_DK, 5)
+    cv.rect(x + 148, y + 33, 32, 10, GREY_DK)
+    cv.rect(x + 140, y + 35, 40, 5, GREY_DK)
+    for sx, sy in ((108, 60), (118, 64), (128, 59), (138, 63)):
+        cv.rect(x + sx, y + sy, 3, 6, WHITE)
+    cv.circle(x + 113, y + 58, 2, WHITE)
+    cv.circle(x + 124, y + 62, 2, WHITE)
+    cv.circle(x + 134, y + 60, 2, WHITE)
+    cv.line(x + 132, y + 6, x + 144, y + 18, INK, 3)
+    cv.line(x + 132, y + 18, x + 144, y + 6, INK, 3)
 
 
-def drone(cv, cx, cy, s, c):
-    cv.line(cx - 7 * s, cy - 5 * s, cx + 7 * s, cy + 5 * s, c, 2.2 * s)
-    cv.line(cx + 7 * s, cy - 5 * s, cx - 7 * s, cy + 5 * s, c, 2.2 * s)
-    for dx, dy in ((-7, -5), (7, -5), (-7, 5), (7, 5)):
-        cv.circle(cx + dx * s, cy + dy * s, 2.6 * s, c)
-    cv.circle(cx, cy, 3 * s, c)
-    cv.circle(cx, cy, 1.2 * s, (255, 70, 60))
+def scene_microsoft(cv, x, y):
+    cv.rect(x, y, 180, 70, NAVY_DK)
+    cv.rect(x + 46, y + 7, 112, 48, NAVY_LT)
+    cv.rect_outline(x + 46, y + 7, 112, 48, GREY_LT, 2)
+    cv.rect(x + 52, y + 13, 100, 36, NAVY_DK)
+    cv.line(x + 64, y + 19, x + 140, y + 43, RED, 6)
+    cv.line(x + 140, y + 19, x + 64, y + 43, RED, 6)
+    cv.rect(x + 94, y + 55, 16, 5, GREY_LT)
+    cv.rect(x + 82, y + 60, 40, 4, GREY_LT)
+    cv.rect(x + 8, y + 44, 27, 17, WHITE)
+    cv.poly([(x + 8, y + 44), (x + 35, y + 44), (x + 21, y + 54)], GREY_LT)
 
 
-def shield(cv, cx, top, w, h, c):
-    hw = w / 2.0
-    cv.poly([(cx - hw, top), (cx + hw, top), (cx + hw, top + h * 0.42),
-             (cx + hw * 0.62, top + h * 0.78), (cx, top + h),
-             (cx - hw * 0.62, top + h * 0.78), (cx - hw, top + h * 0.42)], c)
+def scene_hormuz(cv, x, y):
+    cv.rect(x, y, 180, 42, SKY)
+    cv.rect(x, y + 42, 180, 28, SEA)
+    cv.poly([(x + 6, y + 50), (x + 88, y + 50), (x + 76, y + 61), (x + 18, y + 61)], GREY_DK)
+    cv.rect(x + 24, y + 44, 44, 6, GREY)
+    cv.rect(x + 40, y + 32, 12, 12, GREY)
+    cv.line(x + 46, y + 32, x + 46, y + 24, GREY_DK, 2)
+    cv.line(x + 62, y + 42, x + 80, y + 35, GREY_DK, 3)
+    cv.rect(x + 108, y + 52, 66, 9, RED_DK)
+    for bx in (114, 134, 154):
+        cv.rect(x + bx, y + 45, 14, 7, GREY_LT)
+    cv.rect(x + 162, y + 38, 10, 14, GREY_LT)
+    for wx in range(8, 172, 20):
+        cv.rect(x + wx, y + 66, 9, 2, (150, 210, 215))
 
 
-def plume(cv, cx, cy):
-    blobs = ((0, 0, 15, (96, 104, 120)), (-13, 13, 12, (78, 86, 102)),
-             (-27, 24, 10, (112, 120, 136)), (5, 19, 11, (86, 94, 110)),
-             (-8, 33, 9, (104, 112, 128)), (-20, 40, 8, (70, 78, 94)))
-    for dx, dy, r, c in blobs:
-        cv.circle(cx + dx, cy - dy, r, c)
+def scene_cop31(cv, x, y):
+    cv.rect(x, y, 180, 60, PAPER_DK)
+    cv.rect(x, y + 60, 180, 10, GREEN_DK)
+    cv.rect(x + 16, y + 22, 16, 38, GREY_DK)
+    cv.rect(x + 40, y + 30, 13, 30, GREY)
+    cv.rect(x + 14, y + 19, 20, 4, GREY_DK)
+    cv.rect(x + 38, y + 27, 17, 4, GREY)
+    cv.circle(x + 24, y + 12, 7, GREY)
+    cv.circle(x + 33, y + 7, 5, GREY)
+    cv.circle(x + 47, y + 20, 6, GREY)
+    cv.poly([(x + 118, y + 58), (x + 148, y + 14), (x + 168, y + 10),
+             (x + 167, y + 42), (x + 142, y + 62)], LEAF)
+    cv.line(x + 124, y + 54, x + 160, y + 18, GREEN_DK, 2)
+    cv.ring(x + 90, y + 38, 6, 3, BROWN)
+    cv.line(x + 84, y + 38, x + 62, y + 38, BROWN, 2)
+    cv.line(x + 96, y + 38, x + 116, y + 38, BROWN, 2)
 
 
-# --------------------------------------------------------------------------
-# HERO scene - the barrage over Kyiv (box given by caller).
-# --------------------------------------------------------------------------
-
-def sc_hero(cv, x, y, w, h):
-    cv.vgrad(x, y, w, h, (7, 11, 36), (30, 56, 92))
-    rng = Rng(7)
-    for _ in range(110):
-        sx = x + rng.frac() * w
-        sy = y + rng.frac() * h * 0.5
-        col = (214, 224, 250) if rng.frac() < 0.7 else (255, 240, 200)
-        cv.circle(sx, sy, 0.8 + rng.frac() * 0.9, col)
-    # moon crescent
-    cv.circle(x + w - 70, y + 34, 15, (233, 237, 245))
-    cv.circle(x + w - 78, y + 29, 13, (11, 19, 45))
-    # faint night clouds drifting over the city
-    cloud(cv, x + 180, y + 26, 16, (16, 24, 46))
-    cloud(cv, x + 620, y + 18, 13, (14, 22, 42))
-    cloud(cv, x + 880, y + 52, 12, (16, 24, 46))
-    cloud(cv, x + 420, y + 40, 11, (15, 23, 44))
-    # searchlight beams
-    river_top = y + h - 58
-    cv.poly([(x + 120, river_top), (x + 330, y + 6), (x + 386, y + 6),
-             (x + 210, river_top)], (58, 78, 112))
-    cv.poly([(x + w - 140, river_top), (x + w - 330, y + 4),
-             (x + w - 282, y + 4), (x + w - 60, river_top)], (52, 70, 104))
-    # fire-glow on the horizon behind the skyline
-    cv.ellipse(x + 205, river_top - 4, 95, 15, (96, 44, 26))
-    cv.ellipse(x + 550, river_top - 3, 80, 13, (88, 40, 24))
-    cv.ellipse(x + 840, river_top - 5, 90, 14, (96, 44, 26))
-    # two skyline layers with lit windows
-    for seed, col, dark, lit_p in ((11, (15, 23, 43), (26, 38, 62), 0.42),
-                                   (29, (9, 14, 27), (16, 24, 40), 0.16)):
-        rng = Rng(seed)
-        bx = x + 4
-        while bx < x + w - 12:
-            bw = rng.range(34, 88)
-            bh = rng.range(28, 92)
-            cv.fill_rect(bx, river_top - bh, bw, bh, col)
-            wy = river_top - bh + 5
-            while wy < river_top - 5:
-                wx = bx + 4
-                while wx < bx + bw - 5:
-                    if rng.frac() < lit_p:
-                        cv.fill_rect(wx, wy, 3.4, 4.4, (255, 196, 92))
-                    else:
-                        cv.fill_rect(wx, wy, 3.4, 4.4, dark)
-                    wx += 9
-                wy += 8
-            bx += bw + rng.range(2, 10)
-    # the Dnipro
-    cv.vgrad(x, river_top, w, 58, (9, 28, 54), (19, 56, 94))
-    rng = Rng(31)
-    for _ in range(46):
-        rx = x + rng.frac() * w
-        ry = river_top + 6 + rng.frac() * 44
-        ln = 8 + rng.frac() * 22
-        col = (255, 178, 96) if rng.frac() < 0.3 else (96, 138, 178)
-        cv.fill_rect(rx, ry, ln, 1.6, col)
-    # bridge: pylons, deck, cables, lights
-    deck_y = river_top - 8
-    pylons = (x + w * 0.31, x + w * 0.66)
-    for px in pylons:
-        cv.fill_rect(px - 5, deck_y - 58, 10, 66, (22, 32, 52))
-        cv.circle(px, deck_y - 60, 2.4, (255, 214, 130))
-    cv.fill_rect(x + 34, deck_y, w - 68, 5.5, (34, 46, 68))
-    cv.fill_rect(x + 34, deck_y, w - 68, 1.8, (96, 118, 148))
-    for px in pylons:
-        for dx in (-150, -100, -55, -20, 20, 55, 100, 150):
-            cv.line(px, deck_y - 56, px + dx, deck_y, (104, 126, 158), 1.3)
-    lx = x + 52
-    while lx < x + w - 40:
-        cv.circle(lx, deck_y - 3, 1.7, (255, 210, 120))
-        lx += 46
-    # smoke, trails, bursts, drones
-    plume(cv, x + 205, deck_y - 6)
-    plume(cv, x + 548, deck_y - 2)
-    plume(cv, x + 838, deck_y - 8)
-    trails = ((90, -4, 208, deck_y - 10), (330, -4, 452, 64),
-              (520, -4, 550, deck_y - 4), (690, -4, 756, 52),
-              (930, -4, 840, deck_y - 12), (40, 44, 150, 120),
-              (880, 30, 800, 96), (240, -4, 300, 88))
-    for sx, sy, tx, ty in trails:
-        cv.line(x + sx, y + sy, x + tx, y + ty, (110, 128, 158), 6.5)
-        cv.line(x + sx, y + sy, x + tx, y + ty, (168, 184, 208), 3.4)
-        cv.line(x + sx, y + sy, x + tx, y + ty, (232, 238, 250), 1.5)
-    burst(cv, x + 208, deck_y - 12, 17)
-    burst(cv, x + 452, y + 64, 13)
-    burst(cv, x + 550, deck_y - 6, 15)
-    burst(cv, x + 756, y + 52, 12)
-    burst(cv, x + 840, deck_y - 14, 16)
-    burst(cv, x + 300, y + 88, 10)
-    drone(cv, x + 250, y + 52, 1.6, (10, 14, 24))
-    drone(cv, x + 700, y + 30, 1.4, (10, 14, 24))
-    drone(cv, x + 120, y + 96, 1.2, (10, 14, 24))
+def scene_haiti(cv, x, y):
+    cv.rect(x, y, 180, 70, SEA)
+    cv.ellipse(x + 66, y + 57, 54, 12, SAND)
+    cv.line(x + 54, y + 56, x + 63, y + 30, BROWN, 4)
+    for ex, ey in ((40, 17), (52, 11), (68, 11), (82, 17), (46, 23)):
+        cv.line(x + 63, y + 29, x + ex, y + ey, GREEN_DK, 3)
+    cv.circle(x + 59, y + 33, 3, BROWN)
+    cv.circle(x + 67, y + 34, 3, BROWN)
+    cv.poly([(x + 126, y + 13), (x + 158, y + 13), (x + 158, y + 35),
+             (x + 142, y + 57), (x + 126, y + 35)], TEAL_DK)
+    cv.poly([(x + 142, y + 24), (x + 147, y + 33), (x + 142, y + 42),
+             (x + 137, y + 33)], GOLD)
+    cv.circle(x + 142, y + 33, 2, GOLD)
 
 
-# --------------------------------------------------------------------------
-# Panel scenes.  Each fills the box (x, y, 182, 79).
-# --------------------------------------------------------------------------
-
-def sc_peace(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (172, 216, 224), (240, 246, 236))
-    for fx, fc in ((28, (198, 40, 44)), (80, (34, 82, 158)),
-                   (132, (198, 40, 44))):
-        cv.fill_rect(x + fx + 14, y + 4, 2.4, 40, (90, 74, 60))
-        cv.fill_rect(x + fx + 16, y + 5, 30, 14, fc)
-        cv.fill_rect(x + fx + 16, y + 5, 30, 3, mix(fc, (255, 255, 255), 0.25))
-    star5(cv, x + 59, y + 12, 5, (250, 200, 70))
-    for dx in (-6, 0, 6):
-        cv.circle(x + 111 + dx, y + 9, 1.8, (240, 244, 250))
-        cv.circle(x + 111 + dx, y + 15, 1.8, (240, 244, 250))
-    cv.ring(x + 163, y + 12, 4.6, 1.8, (250, 200, 70))
-    # chairs
-    for cxh, cc in ((44, (176, 32, 40)), (78, (30, 70, 150)),
-                    (112, (206, 158, 44))):
-        cv.fill_rect(x + cxh, y + 33, 26, 19, cc)
-        cv.ellipse(x + cxh + 13, y + 33, 13, 5, cc)
-    # table
-    cv.poly([(x + 82, y + 60), (x + 100, y + 60), (x + 105, y + 76),
-             (x + 77, y + 76)], (96, 66, 40))
-    cv.ellipse(x + 91, y + 60, 53, 13, (110, 76, 46))
-    cv.ellipse(x + 91, y + 57, 53, 13, (150, 108, 70))
-    cv.ellipse(x + 91, y + 56, 46, 10, (164, 122, 80))
-    # document and cups on the table
-    cv.fill_rect(x + 80, y + 50, 22, 9, (250, 250, 246))
-    cv.line(x + 83, y + 53, x + 99, y + 53, (150, 150, 150), 1.2)
-    cv.line(x + 83, y + 56, x + 97, y + 56, (150, 150, 150), 1.2)
-    cv.fill_rect(x + 58, y + 52, 5, 4, (240, 240, 240))
-    cv.fill_rect(x + 118, y + 52, 5, 4, (240, 240, 240))
-    # dove above
-    cv.poly([(x + 102, y + 24), (x + 116, y + 19), (x + 113, y + 28)],
-            (236, 236, 232))
-    cv.poly([(x + 84, y + 21), (x + 70, y + 10), (x + 76, y + 24)],
-            (250, 250, 248))
-    cv.ellipse(x + 91, y + 23, 13, 7, (250, 250, 248))
-    cv.circle(x + 79, y + 19, 4.2, (250, 250, 248))
-    cv.poly([(x + 75, y + 18), (x + 69, y + 20), (x + 75, y + 22)],
-            (255, 160, 60))
-    cv.line(x + 70, y + 21, x + 62, y + 27, (70, 150, 80), 1.8)
-    cv.ellipse(x + 64, y + 25, 3.4, 1.8, (70, 160, 84))
-    cv.ellipse(x + 68, y + 28, 3.0, 1.6, (70, 160, 84))
+def scene_ukeu(cv, x, y):
+    cv.rect(x, y, 180, 70, SKY)
+    cv.rect(x + 22, y + 17, 58, 38, NAVY)
+    cv.circle(x + 80, y + 36, 9, NAVY)
+    cv.rect_outline(x + 22, y + 17, 58, 38, INK, 2)
+    cv.circle(x + 80, y + 36, 9, NAVY)
+    for sx, sy in ((46, 24), (58, 29), (58, 43), (46, 48), (34, 43), (34, 29)):
+        cv.circle(x + sx, y + sy, 3, GOLD)
+    cv.rect(x + 96, y + 17, 60, 38, WHITE)
+    cv.rect(x + 121, y + 17, 10, 38, RED)
+    cv.rect(x + 96, y + 31, 60, 10, RED)
+    cv.rect_outline(x + 96, y + 17, 60, 38, INK, 2)
+    cv.circle(x + 96, y + 36, 9, SKY)
 
 
-def sc_court(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (158, 196, 228), (233, 241, 247))
-    cv.circle(x + 162, y + 10, 15, (250, 226, 150))
-    cv.circle(x + 162, y + 10, 10, (252, 238, 186))
-    cv.fill_rect(x, y + 66, 182, 13, (198, 188, 164))
-    for i, sw_ in enumerate((118, 132, 146)):
-        cv.fill_rect(x + 91 - sw_ / 2, y + 60 + i * 3.2, sw_, 3.2,
-                     (172 - i * 9, 172 - i * 9, 180 - i * 9))
-    cv.fill_rect(x + 37, y + 26, 108, 34, (204, 206, 214))
-    for i in range(5):
-        cx_ = x + 45 + i * 23
-        cv.fill_rect(cx_, y + 27, 10, 32, (241, 242, 246))
-        cv.fill_rect(cx_ + 7, y + 27, 3, 32, (196, 198, 208))
-        cv.fill_rect(cx_ - 1, y + 25, 12, 3, (228, 229, 235))
-        cv.fill_rect(cx_ - 1, y + 57, 12, 3, (228, 229, 235))
-    cv.fill_rect(x + 33, y + 20, 116, 6, (233, 234, 239))
-    cv.poly([(x + 37, y + 20), (x + 145, y + 20), (x + 91, y + 7)],
-            (221, 222, 229))
-    cv.circle(x + 91, y + 16, 3.2, (206, 164, 52))
-    # scales of justice standing on the steps
-    gold, gold_d = (216, 174, 64), (172, 134, 42)
-    cv.line(x + 84, y + 59, x + 98, y + 59, gold_d, 3)
-    cv.line(x + 91, y + 59, x + 91, y + 33, gold_d, 2.6)
-    cv.line(x + 68, y + 33, x + 114, y + 33, gold_d, 2.6)
-    cv.circle(x + 91, y + 33, 2.4, gold)
-    for px in (68, 114):
-        cv.line(x + px, y + 33, x + px - 6, y + 43, gold_d, 1.2)
-        cv.line(x + px, y + 33, x + px + 6, y + 43, gold_d, 1.2)
-        cv.ellipse(x + px, y + 44, 8.5, 2.8, gold)
-        cv.ellipse(x + px, y + 43, 8.5, 2.2, (238, 204, 110))
-    for bx in (16, 166):
-        cv.circle(x + bx, y + 62, 6.5, (110, 164, 88))
-        cv.circle(x + bx - 5, y + 65, 4.5, (94, 148, 78))
-        cv.circle(x + bx + 5, y + 65, 4.5, (94, 148, 78))
-
-
-def sc_markets(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (10, 16, 34), (22, 34, 58))
-    for gx in range(0, 183, 18):
-        cv.line(x + gx, y, x + gx, y + 79, (34, 50, 82), 1)
-    for gy in range(0, 80, 16):
-        cv.line(x, y + gy, x + 182, y + gy, (34, 50, 82), 1)
-    cx_, cy_, r = x + 52, y + 40, 27
-    cv.circle(cx_, cy_, r + 2.5, (18, 44, 78))
-    cv.circle(cx_, cy_, r, (26, 78, 132))
-    for bx, by, br in ((44, 28, 7), (52, 24, 5), (38, 36, 5), (58, 40, 8),
-                       (50, 50, 6), (63, 30, 4), (42, 56, 4), (66, 50, 5)):
-        cv.circle(x + bx, y + by, br, (44, 148, 88))
-    cv.ellipse_ring(cx_, cy_, 12, 27, 1.2, (70, 130, 185))
-    cv.ellipse_ring(cx_, cy_, 22, 27, 1.2, (70, 130, 185))
-    cv.ring(cx_, cy_, r, 1.6, (86, 148, 205))
-    pts = [(84, 14), (102, 22), (114, 17), (128, 30), (140, 26),
-           (156, 44), (172, 58)]
-    for wd, col in ((9, (110, 26, 34)), (5, (232, 48, 52))):
-        for a, b in zip(pts, pts[1:]):
-            cv.line(x + a[0], y + a[1], x + b[0], y + b[1], col, wd)
-    cv.poly([(x + 172, y + 58), (x + 160, y + 56), (x + 168, y + 46)],
-            (240, 70, 70))
-    for i, (chh, cg) in enumerate(((10, (232, 48, 52)), (7, (64, 200, 110)),
-                                   (12, (232, 48, 52)), (8, (232, 48, 52)))):
-        cx2 = x + 118 + i * 15
-        cv.fill_rect(cx2, y + 74 - chh, 8, chh, cg)
-        cv.line(cx2 + 4, y + 71 - chh, cx2 + 4, y + 76, cg, 1.4)
-
-
-def sc_ipo(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (40, 34, 88), (96, 66, 148))
-    rng = Rng(5)
-    for _ in range(14):
-        cv.circle(x + rng.range(4, 178), y + rng.range(3, 40), 1.1,
-                  (200, 190, 240))
-    cv.fill_rect(x + 14, y + 12, 56, 5, (122, 84, 50))
-    cv.fill_rect(x + 17, y + 17, 5, 30, (106, 72, 44))
-    cv.fill_rect(x + 62, y + 17, 5, 30, (106, 72, 44))
-    cv.fill_rect(x + 12, y + 47, 60, 4, (106, 72, 44))
-    cv.circle(x + 42, y + 26, 13, (238, 186, 74))
-    cv.poly([(x + 29, y + 26), (x + 55, y + 26), (x + 60, y + 40),
-             (x + 24, y + 40)], (238, 186, 74))
-    cv.poly([(x + 29, y + 26), (x + 38, y + 26), (x + 34, y + 40),
-             (x + 24, y + 40)], (250, 208, 116))
-    cv.fill_rect(x + 23, y + 40, 38, 3.4, (206, 152, 52))
-    cv.circle(x + 42, y + 46, 3.4, (150, 108, 40))
-    cv.line(x + 86, y + 68, x + 176, y + 68, (205, 205, 225), 1.6)
-    cv.line(x + 86, y + 68, x + 86, y + 10, (205, 205, 225), 1.6)
-    up = [(88, 64), (102, 56), (116, 38), (128, 20)]
-    for a, b in zip(up, up[1:]):
-        cv.line(x + a[0], y + a[1], x + b[0], y + b[1], (70, 216, 124), 4.6)
-    sparkle(cv, x + 130, y + 16, 6, (255, 240, 170))
-    sparkle(cv, x + 118, y + 10, 4, (255, 255, 255))
-    sparkle(cv, x + 142, y + 24, 4, (255, 240, 170))
-    dn = [(128, 20), (142, 32), (156, 48), (172, 62)]
-    for a, b in zip(dn, dn[1:]):
-        cv.line(x + a[0], y + a[1], x + b[0], y + b[1], (240, 74, 70), 4.6)
-    cv.poly([(x + 172, y + 62), (x + 161, y + 60), (x + 169, y + 50)],
-            (244, 96, 92))
+def scene_saudi(cv, x, y):
+    cv.rect(x, y, 180, 70, NAVY)
+    for bx, bh in ((6, 18), (30, 26), (58, 14), (120, 22), (146, 30), (164, 16)):
+        cv.rect(x + bx, y + 70 - bh, 20, bh, NAVY_DK)
+    cv.poly([(x + 74, y + 6), (x + 106, y + 6), (x + 106, y + 28),
+             (x + 90, y + 48), (x + 74, y + 28)], GOLD)
+    cv.poly([(x + 79, y + 11), (x + 101, y + 11), (x + 101, y + 27),
+             (x + 90, y + 41), (x + 79, y + 27)], GOLD_DK)
+    cv.circle(x + 90, y + 22, 4, WHITE)
     for i in range(9):
-        cv.fill_rect(x + 88 + i * 10, y + 72, 6, 3,
-                     (240, 200, 90) if i % 2 else (120, 200, 150))
+        t = i / 8
+        ax = int(8 + (66 - 8) * t)
+        ay = int(4 + 26 * (t * t) + 14 * t)
+        cv.circle(x + ax, y + ay, 2, RED)
+    for i in range(9):
+        t = i / 8
+        ax = int(172 - (172 - 114) * t)
+        ay = int(2 + 26 * (t * t) + 16 * t)
+        cv.circle(x + ax, y + ay, 2, RED)
+    for sx, sy in ((70, 22), (110, 20)):
+        cv.line(x + sx - 5, y + sy, x + sx + 5, y + sy, YELLOW, 2)
+        cv.line(x + sx, y + sy - 5, x + sx, y + sy + 5, YELLOW, 2)
 
 
-def sc_kerch(cv, x, y):
-    cv.vgrad(x, y, 182, 44, (168, 204, 226), (236, 243, 245))
-    cv.vgrad(x, y + 44, 182, 35, (34, 112, 142), (58, 152, 178))
-    cv.circle(x + 16, y + 12, 7, (252, 226, 140))
-    cloud(cv, x + 34, y + 10, 6, (250, 252, 253))
-    cloud(cv, x + 148, y + 8, 5, (244, 248, 250))
-    cv.fill_rect(x, y + 40, 182, 3, (140, 160, 165))
-    cv.fill_rect(x + 2, y + 38, 100, 4.4, (92, 100, 112))
-    cv.fill_rect(x + 2, y + 36.6, 100, 1.6, (170, 180, 190))
-    for px in (26, 66):
-        cv.fill_rect(x + px, y + 40, 5, 16, (80, 88, 100))
-    cv.line(x + 102, y + 40, x + 140, y + 56, (84, 92, 104), 6.5)
-    cv.line(x + 102, y + 38.6, x + 140, y + 54.6, (150, 160, 172), 1.8)
-    cv.fill_rect(x + 152, y + 40, 28, 4.4, (92, 100, 112))
-    cv.fill_rect(x + 166, y + 42, 5, 13, (80, 88, 100))
-    cv.line(x + 146, y + 58, x + 160, y + 50, (84, 92, 104), 5)
-    cv.line(x + 148, y + 60, x + 158, y + 67, (84, 92, 104), 3.6)
-    for sx_, sr in ((126, 5.5), (140, 4.4), (114, 3.8), (152, 3.2)):
-        cv.circle(x + sx_, y + 63, sr, (240, 248, 250))
-        cv.circle(x + sx_ - sr * 0.7, y + 65, sr * 0.62, (226, 242, 248))
-        cv.circle(x + sx_ + sr * 0.7, y + 65, sr * 0.62, (226, 242, 248))
-    cv.ellipse(x + 133, y + 66, 26, 3.4, (214, 238, 246))
-    for wx, wy in ((20, 66), (52, 70), (160, 70), (88, 72), (30, 74)):
-        cv.line(x + wx, y + wy, x + wx + 12, y + wy, (200, 230, 240), 1.6)
-    cv.line(x + 108, y + 10, x + 138, y + 16, (90, 100, 110), 1.4, dash=(3, 3))
-    drone(cv, x + 146, y + 18, 1.0, (30, 38, 50))
+def scene_greenland(cv, x, y):
+    cv.rect(x, y, 180, 70, SEA)
+    cv.poly([(x + 26, y + 52), (x + 58, y + 38), (x + 108, y + 35),
+             (x + 146, y + 45), (x + 150, y + 59), (x + 32, y + 61)], WHITE)
+    cv.poly([(x + 108, y + 35), (x + 146, y + 45), (x + 150, y + 59),
+             (x + 112, y + 56)], SKY_DK)
+    cv.line(x + 86, y + 38, x + 86, y + 11, INK, 2)
+    cv.rect(x + 86, y + 11, 27, 8, WHITE)
+    cv.rect(x + 86, y + 19, 27, 8, RED)
+    cv.circle(x + 95, y + 19, 5, RED)
+    cv.rect(x + 90, y + 14, 10, 5, WHITE)
+    cv.poly([(x + 128, y + 38), (x + 148, y + 38), (x + 148, y + 50),
+             (x + 138, y + 60), (x + 128, y + 50)], TEAL)
+    cv.rect(x + 136, y + 42, 4, 10, WHITE)
+    cv.rect(x + 133, y + 45, 10, 4, WHITE)
 
 
-def sc_microsoft(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (26, 33, 48), (44, 56, 76))
-    cv.fill_rect(x + 8, y + 8, 10, 10, (250, 214, 96))
-    cv.fill_rect(x + 164, y + 6, 10, 10, (244, 156, 168))
-    cv.fill_rect(x + 150, y + 20, 8, 8, (150, 220, 170))
-    cv.fill_rect(x, y + 64, 182, 15, (16, 21, 31))
-    cv.fill_rect(x + 36, y + 8, 110, 52, (12, 17, 25))
-    cv.fill_rect(x + 40, y + 12, 102, 44, (32, 48, 72))
-    cv.fill_rect(x + 50, y + 22, 34, 23, (214, 224, 238))
-    cv.line(x + 50, y + 22, x + 67, y + 35, (90, 110, 140), 2)
-    cv.line(x + 84, y + 22, x + 67, y + 35, (90, 110, 140), 2)
-    cv.fill_rect(x + 96, y + 22, 30, 19, (96, 168, 226))
-    cv.poly([(x + 102, y + 41), (x + 112, y + 41), (x + 103, y + 49)],
-            (96, 168, 226))
-    for dx in (104, 111, 118):
-        cv.circle(x + dx, y + 31, 2, (230, 244, 252))
-    cv.line(x + 44, y + 14, x + 138, y + 54, (148, 22, 30), 8.5)
-    cv.line(x + 138, y + 14, x + 44, y + 54, (148, 22, 30), 8.5)
-    cv.line(x + 44, y + 14, x + 138, y + 54, (228, 46, 50), 5.5)
-    cv.line(x + 138, y + 14, x + 44, y + 54, (228, 46, 50), 5.5)
-    cv.fill_rect(x + 86, y + 60, 10, 6, (10, 14, 20))
-    cv.fill_rect(x + 72, y + 66, 38, 4, (10, 14, 20))
-    cv.fill_rect(x + 156, y + 56, 9, 9, (226, 90, 80))
-    cv.ring(x + 168, y + 60, 3.4, 1.6, (226, 90, 80))
+def scene_vietnam(cv, x, y):
+    cv.rect(x, y, 180, 70, PAPER_DK)
+    cv.rect(x + 34, y + 6, 6, 56, BROWN)
+    cv.rect(x + 34, y + 6, 54, 6, BROWN)
+    cv.line(x + 84, y + 12, x + 84, y + 25, BROWN, 3)
+    cv.ring(x + 84, y + 35, 9, 3, BROWN)
+    cv.ring(x + 88, y + 36, 26, 6, RED)
+    cv.line(x + 69, y + 17, x + 107, y + 55, RED, 6)
 
 
-def tanker(cv, cx, cy, s):
-    cv.poly([(cx - 26 * s, cy - 4 * s), (cx + 26 * s, cy - 4 * s),
-             (cx + 20 * s, cy + 4 * s), (cx - 20 * s, cy + 4 * s)],
-            (38, 46, 58))
-    cv.fill_rect(cx - 16 * s, cy - 9 * s, 30 * s, 5 * s, (52, 62, 74))
-    cv.fill_rect(cx + 12 * s, cy - 13 * s, 6 * s, 9 * s, (66, 76, 90))
-    cv.fill_rect(cx - 20 * s, cy - 12 * s, 8 * s, 3 * s, (150, 70, 58))
+def scene_cyber(cv, x, y):
+    cv.rect(x, y, 180, 70, NAVY)
+    cv.poly([(x + 24, y + 9), (x + 62, y + 9), (x + 62, y + 33),
+             (x + 43, y + 61), (x + 24, y + 33)], NAVY_LT)
+    cv.rect_outline(x + 24, y + 9, 38, 24, GREY_LT, 2)
+    pts = [(43, 13), (37, 25), (46, 31), (39, 43), (44, 55)]
+    for i in range(len(pts) - 1):
+        cv.line(x + pts[i][0], y + pts[i][1], x + pts[i + 1][0], y + pts[i + 1][1], WHITE, 2)
+    cv.rect(x + 104, y + 12, 54, 52, BROWN)
+    cv.rect(x + 118, y + 16, 40, 48, PAPER_DK)
+    cv.poly([(x + 118, y + 16), (x + 102, y + 22), (x + 102, y + 58),
+             (x + 118, y + 64)], GOLD_DK)
+    cv.rect(x + 120, y + 3, 38, 11, RED)
+    draw_text(cv, x + 125, y + 5, "EXIT", 1, WHITE, 1, True)
 
 
-def warship(cv, cx, cy, s):
-    cv.poly([(cx - 34 * s, cy), (cx + 34 * s, cy), (cx + 26 * s, cy + 9 * s),
-             (cx - 27 * s, cy + 9 * s)], (98, 108, 122))
-    cv.fill_rect(cx - 24 * s, cy - 6 * s, 46 * s, 6 * s, (122, 133, 148))
-    cv.fill_rect(cx - 8 * s, cy - 14 * s, 18 * s, 8 * s, (134, 145, 160))
-    cv.fill_rect(cx - 4 * s, cy - 19 * s, 10 * s, 5 * s, (146, 157, 172))
-    cv.line(cx + 16 * s, cy - 6 * s, cx + 30 * s, cy - 12 * s,
-            (70, 78, 90), 2.4 * s)
-    cv.line(cx - 18 * s, cy - 6 * s, cx - 18 * s, cy - 20 * s,
-            (70, 78, 90), 1.8 * s)
-    cv.fill_rect(cx - 18 * s, cy - 20 * s, 9 * s, 3.4 * s, (226, 60, 54))
-    cv.line(cx - 34 * s, cy + 8 * s, cx - 48 * s, cy + 12 * s,
-            (200, 228, 240), 1.6 * s)
-    cv.line(cx + 34 * s, cy + 8 * s, cx + 46 * s, cy + 12 * s,
-            (200, 228, 240), 1.6 * s)
+def scene_iraq(cv, x, y):
+    cv.rect(x, y, 180, 56, SAND)
+    cv.circle(x + 90, y + 57, 21, ORANGE)
+    cv.rect(x, y + 56, 180, 14, PAPER_DK)
+    cv.rect(x + 8, y + 40, 24, 16, NAVY_DK)
+    cv.rect(x + 38, y + 34, 20, 22, NAVY_DK)
+    cv.circle(x + 48, y + 34, 10, NAVY_DK)
+    cv.rect(x + 138, y + 15, 7, 41, NAVY_DK)
+    cv.circle(x + 141, y + 13, 5, NAVY_DK)
+    cv.rect(x + 152, y + 38, 22, 18, NAVY_DK)
+    cv.rect(x + 76, y + 29, 28, 27, NAVY_DK)
+    cv.circle(x + 90, y + 41, 8, SAND)
+    cv.rect(x + 82, y + 41, 16, 15, SAND)
+    cv.line(x + 90, y + 29, x + 90, y + 7, INK, 2)
+    cv.rect(x + 90, y + 7, 21, 4, RED)
+    cv.rect(x + 90, y + 11, 21, 4, WHITE)
+    cv.rect(x + 90, y + 15, 21, 4, INK)
 
 
-def sc_hormuz(cv, x, y):
-    cv.vgrad(x, y, 182, 40, (238, 158, 84), (250, 216, 156))
-    cv.vgrad(x, y + 40, 182, 39, (30, 86, 122), (44, 124, 164))
-    cv.circle(x + 148, y + 30, 13, (255, 232, 170))
-    cv.circle(x + 148, y + 30, 9, (255, 242, 200))
-    cv.poly([(x, y + 30), (x + 54, y + 32), (x + 34, y + 50), (x, y + 54)],
-            (156, 120, 80))
-    cv.poly([(x, y + 30), (x + 54, y + 32), (x + 44, y + 40), (x, y + 40)],
-            (178, 142, 96))
-    cv.poly([(x + 182, y + 32), (x + 128, y + 34), (x + 150, y + 52),
-             (x + 182, y + 56)], (156, 120, 80))
-    cv.poly([(x + 182, y + 32), (x + 128, y + 34), (x + 140, y + 42),
-             (x + 182, y + 42)], (178, 142, 96))
-    tanker(cv, x + 138, y + 57, 0.62)
-    tanker(cv, x + 158, y + 66, 0.5)
-    warship(cv, x + 84, y + 52, 1.0)
-    for wx, wy in ((14, 66), (44, 72), (120, 72), (66, 70)):
-        cv.line(x + wx, y + wy, x + wx + 13, y + wy, (190, 224, 240), 1.6)
-
-
-def sc_cop(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (172, 212, 226), (240, 245, 236))
-    cv.circle(x + 166, y + 11, 8, (252, 216, 96))
-    cv.fill_rect(x, y + 62, 182, 17, (168, 148, 116))
-    cv.ellipse(x + 140, y + 71, 54, 12, (96, 168, 98))
-    cv.fill_rect(x + 6, y + 42, 62, 22, (130, 122, 116))
-    cv.fill_rect(x + 6, y + 42, 62, 4, (108, 100, 96))
-    for cxh, cht in ((16, 30), (32, 38), (48, 26)):
-        cv.fill_rect(x + cxh, y + 42 - cht, 10, cht, (152, 142, 136))
-        cv.fill_rect(x + cxh, y + 42 - cht, 10, 4, (198, 62, 56))
-    for sx_, sy_, sr, sc in ((22, 8, 5.6, (128, 128, 132)),
-                             (34, 4, 7.6, (150, 150, 154)),
-                             (47, 7, 6.2, (140, 140, 144)),
-                             (56, 2, 5.2, (160, 160, 164))):
-        cv.circle(x + sx_, y + sy_, sr, sc)
-    # the leaf
-    cv.poly([(x + 112, y + 54), (x + 124, y + 26), (x + 148, y + 12),
-             (x + 168, y + 16), (x + 170, y + 34), (x + 152, y + 54),
-             (x + 128, y + 60)], (54, 166, 82))
-    cv.poly([(x + 124, y + 26), (x + 148, y + 12), (x + 150, y + 34),
-             (x + 132, y + 52)], (80, 188, 104))
-    cv.line(x + 118, y + 56, x + 164, y + 18, (38, 118, 60), 2)
-    cv.line(x + 118, y + 56, x + 110, y + 64, (38, 118, 60), 2.4)
-    # knotted rope between factory and leaf
-    cv.line(x + 66, y + 54, x + 88, y + 56, (198, 166, 112), 4)
-    cv.line(x + 100, y + 55, x + 114, y + 55, (198, 166, 112), 4)
-    cv.circle(x + 92, y + 56, 5.5, (186, 154, 100))
-    cv.circle(x + 97, y + 53, 4.6, (208, 178, 124))
-    cv.circle(x + 90, y + 51, 3.6, (176, 144, 92))
-    for fx, fy, fc in ((128, 66, (250, 240, 160)), (150, 70, (250, 250, 250)),
-                       (164, 64, (250, 200, 200))):
-        cv.circle(x + fx, y + fy, 1.8, fc)
-
-
-def sc_haiti(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (110, 186, 224), (222, 240, 248))
-    cv.circle(x + 20, y + 11, 8, (252, 228, 140))
-    cloud(cv, x + 142, y + 10, 6, (250, 252, 253))
-    cv.vgrad(x, y + 54, 182, 25, (36, 130, 170), (64, 164, 198))
-    cv.ellipse(x + 70, y + 60, 66, 11, (240, 216, 152))
-    cv.ellipse(x + 70, y + 57, 66, 11, (246, 226, 168))
-    cv.line(x + 52, y + 58, x + 58, y + 44, (140, 102, 64), 5)
-    cv.line(x + 58, y + 44, x + 66, y + 28, (140, 102, 64), 3.6)
-    for ex, ey, mx, my in ((44, 16, 54, 20), (58, 10, 62, 18),
-                           (76, 10, 70, 18), (88, 18, 76, 22),
-                           (46, 26, 56, 24)):
-        cv.line(x + 66, y + 27, x + mx, y + my, (70, 160, 84), 3)
-        cv.line(x + mx, y + my, x + ex, y + ey, (70, 160, 84), 2.4)
-    cv.circle(x + 63, y + 30, 2.6, (110, 78, 44))
-    cv.circle(x + 69, y + 31, 2.6, (110, 78, 44))
-    shield(cv, x + 136, y + 14, 52, 52, (24, 62, 128))
-    shield(cv, x + 136, y + 17.5, 45, 46, (34, 92, 178))
-    star5(cv, x + 136, y + 36, 10, (248, 198, 66))
-    for wx, wy in ((118, 68), (150, 72), (14, 70)):
-        cv.line(x + wx, y + wy, x + wx + 12, y + wy, (210, 238, 248), 1.6)
-
-
-def sc_ukeu(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (204, 224, 240), (240, 245, 248))
-    cv.ellipse(x + 91, y + 72, 80, 5, (190, 205, 220))
-    bx, by, bw, bh = x + 94, y + 14, 76, 52
-    cv.fill_rect(bx + 3, by + 3, bw, bh, (176, 192, 208))
-    cv.fill_rect(bx, by, bw, bh, (240, 240, 244))
-    cv.fill_rect(bx + 31, by, 13, bh, (206, 32, 44))
-    cv.fill_rect(bx, by + 20, bw, 13, (206, 32, 44))
-    cv.rect_outline(bx, by, bw, bh, (120, 130, 145), 2)
-    ax, ay, aw, ah = x + 12, y + 14, 76, 52
-    cv.fill_rect(ax + 3, ay + 3, aw, ah, (150, 170, 195))
-    cv.fill_rect(ax, ay, aw, ah, (34, 82, 166))
-    cv.circle(ax + aw, ay + 26, 11, (34, 82, 166))
-    cv.circle(ax + aw, ay + 26, 11, (34, 82, 166))
-    for i in range(8):
-        a = i * pi / 4
-        star5(cv, ax + 36 + cos(a) * 17, ay + 26 + sin(a) * 17, 3.4,
-              (250, 200, 70))
-    sparkle(cv, x + 92, y + 10, 6, (250, 190, 60))
-    sparkle(cv, x + 100, y + 66, 4.6, (250, 190, 60))
-
-
-def sc_saudi(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (66, 42, 94), (216, 122, 82))
-    base = y + 64
-    col = (28, 22, 38)
-    cv.fill_rect(x + 4, base - 26, 20, 26, col)
-    cv.fill_rect(x + 28, base - 36, 16, 36, col)
-    cv.fill_rect(x + 50, base - 30, 6, 30, col)
-    cv.fill_rect(x + 66, base - 30, 6, 30, col)
-    cv.fill_rect(x + 48, base - 44, 26, 15, col)
-    cv.fill_rect(x + 82, base - 22, 18, 22, col)
-    cv.fill_rect(x + 140, base - 18, 26, 18, col)
-    cv.circle(x + 153, base - 18, 10, col)
-    cv.fill_rect(x + 168, base - 30, 12, 30, col)
-    rng = Rng(12)
-    for _ in range(16):
-        cv.fill_rect(x + rng.range(6, 174), base - rng.range(4, 40),
-                     2.2, 3, (255, 200, 110))
-    cv.fill_rect(x, base, 182, 15, (198, 152, 98))
-    cv.ellipse(x + 46, base + 2, 36, 7, (210, 166, 108))
-    cv.ellipse(x + 138, base + 3, 34, 6, (188, 142, 90))
-    shield(cv, x + 112, y + 8, 46, 48, (198, 156, 52))
-    shield(cv, x + 112, y + 11, 39, 42, (32, 58, 118))
-    star5(cv, x + 112, y + 28, 8, (250, 226, 150))
-    for sx_, sy_, ex, ey in ((176, 2, 132, 16), (168, 12, 134, 26),
-                             (182, 20, 136, 34)):
-        mx_, my_ = (sx_ + ex) / 2, min(sy_, ey) - 10
-        cv.line(x + sx_, y + sy_, x + mx_, y + my_, (250, 206, 130), 2.6,
-                dash=(4, 3))
-        cv.line(x + mx_, y + my_, x + ex, y + ey, (250, 206, 130), 2.6,
-                dash=(4, 3))
-        burst(cv, x + ex, y + ey, 5.5)
-
-
-def sc_greenland(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (168, 218, 234), (238, 248, 250))
-    cv.circle(x + 18, y + 11, 7.5, (250, 240, 198))
-    cv.vgrad(x, y + 56, 182, 23, (70, 150, 185), (112, 182, 206))
-    cv.poly([(x + 8, y + 58), (x + 24, y + 48), (x + 40, y + 58)],
-            (226, 240, 246))
-    cv.poly([(x + 146, y + 59), (x + 160, y + 50), (x + 176, y + 59)],
-            (226, 240, 246))
-    cv.poly([(x + 28, y + 58), (x + 62, y + 34), (x + 104, y + 28),
-             (x + 140, y + 38), (x + 158, y + 58)], (246, 250, 252))
-    cv.poly([(x + 104, y + 28), (x + 140, y + 38), (x + 158, y + 58),
-             (x + 120, y + 58)], (196, 224, 238))
-    cv.poly([(x + 62, y + 34), (x + 84, y + 44), (x + 70, y + 58),
-             (x + 44, y + 58)], (214, 234, 244))
-    cv.line(x + 96, y + 30, x + 96, y + 6, (70, 74, 82), 2.2)
-    cv.fill_rect(x + 96, y + 6, 24, 7, (248, 248, 248))
-    cv.fill_rect(x + 96, y + 13, 24, 7, (214, 42, 46))
-    cv.circle(x + 103, y + 13, 4.6, (248, 248, 248))
-    arc = []
-    for i in range(7):
-        a = pi + i * pi / 6
-        arc.append((x + 103 + 4.6 * cos(a), y + 13 + 4.6 * sin(a)))
-    cv.poly(arc, (214, 42, 46))
-    shield(cv, x + 136, y + 38, 24, 26, (198, 156, 52))
-    shield(cv, x + 136, y + 40.5, 19, 21, (34, 92, 178))
-    star5(cv, x + 136, y + 49, 4.6, (250, 226, 150))
-    rng = Rng(13)
-    for _ in range(22):
-        cv.circle(x + rng.range(2, 180), y + rng.range(2, 52), 1.1,
-                  (255, 255, 255))
-    for wx in (20, 60, 130, 160):
-        cv.line(x + wx, y + 68, x + wx + 10, y + 68, (220, 242, 250), 1.5)
-
-
-def sc_vietnam(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (198, 190, 178), (230, 224, 210))
-    cv.poly([(x + 52, y + 22), (x + 130, y + 22), (x + 91, y + 10)],
-            (128, 122, 116))
-    cv.fill_rect(x + 56, y + 22, 78, 4, (120, 114, 108))
-    for i in range(4):
-        cv.fill_rect(x + 62 + i * 18, y + 26, 7, 26, (134, 128, 120))
-    cv.fill_rect(x + 52, y + 52, 86, 4, (120, 114, 108))
-    cv.fill_rect(x + 46, y + 56, 98, 4, (110, 104, 98))
-    cv.fill_rect(x, y + 62, 182, 17, (164, 152, 134))
-    cv.fill_rect(x + 40, y + 60, 110, 3, (140, 130, 114))
-    cv.line(x + 91, y + 16, x + 91, y + 27, (120, 92, 58), 3)
-    cv.ellipse_ring(x + 91, y + 38, 8.5, 11, 3, (120, 92, 58))
-    cv.ring(x + 91, y + 38, 21, 5.5, (206, 34, 40))
-    cv.line(x + 76, y + 23, x + 106, y + 53, (206, 34, 40), 5.5)
-    cv.line(x + 58, y + 66, x + 70, y + 63, (120, 92, 58), 2.4)
-    cv.line(x + 112, y + 65, x + 124, y + 68, (120, 92, 58), 2.4)
-
-
-def sc_cyber(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (52, 62, 84), (88, 100, 124))
-    cv.fill_rect(x, y + 62, 182, 17, (36, 42, 56))
-    cv.line(x, y + 62, x + 182, y + 62, (120, 132, 152), 1.6)
-    shield(cv, x + 52, y + 10, 58, 56, (16, 24, 38))
-    shield(cv, x + 52, y + 12, 52, 51, (58, 110, 168))
-    shield(cv, x + 52, y + 16, 42, 42, (84, 140, 200))
-    cv.circle(x + 52, y + 34, 5, (14, 22, 34))
-    cv.poly([(x + 48.5, y + 36), (x + 55.5, y + 36), (x + 57, y + 46),
-             (x + 47, y + 46)], (14, 22, 34))
-    crack = [(40, 14), (48, 24), (43, 32), (52, 42), (47, 52), (54, 60)]
-    for a, b in zip(crack, crack[1:]):
-        cv.line(x + a[0], y + a[1], x + b[0], y + b[1], (16, 24, 36), 2.6)
-    # open exit door with light spilling out
-    cv.fill_rect(x + 118, y + 8, 52, 56, (20, 26, 38))
-    cv.vgrad(x + 122, y + 12, 44, 52, (252, 224, 148), (246, 196, 104))
-    cv.poly([(x + 122, y + 12), (x + 104, y + 18), (x + 104, y + 58),
-             (x + 122, y + 64)], (150, 96, 54))
-    cv.poly([(x + 122, y + 12), (x + 104, y + 18), (x + 104, y + 58),
-             (x + 122, y + 64)], (160, 104, 60))
-    cv.circle(x + 108, y + 38, 2.2, (250, 220, 150))
-    cv.poly([(x + 122, y + 64), (x + 166, y + 64), (x + 178, y + 76),
-             (x + 110, y + 76)], (240, 200, 116))
-    cv.fill_rect(x + 124, y + 0.5, 40, 10, (206, 40, 44))
-    cv.text(x + 144, y + 2.2, "EXIT", 7, (255, 244, 230), align='c',
-            condense=1.0)
-
-
-def sc_iraq(cv, x, y):
-    cv.vgrad(x, y, 182, 79, (246, 166, 84), (252, 226, 172))
-    for a in (0.35, 0.8, 1.25, 1.7, 2.2, 2.65):
-        cv.line(x + 58 + cos(a) * 20, y + 52 - sin(a) * 20,
-                x + 58 + cos(a) * 27, y + 52 - sin(a) * 27,
-                (255, 200, 110), 2)
-    cv.circle(x + 58, y + 52, 17, (255, 214, 130))
-    cv.circle(x + 58, y + 52, 12.5, (255, 232, 168))
-    col, col_d = (146, 104, 66), (128, 90, 56)
-    cv.fill_rect(x + 6, y + 44, 30, 22, col)
-    cv.fill_rect(x + 40, y + 38, 26, 28, col_d)
-    cv.circle(x + 53, y + 38, 9, col_d)
-    cv.fill_rect(x + 118, y + 40, 30, 26, col)
-    cv.circle(x + 133, y + 40, 8, col)
-    cv.fill_rect(x + 152, y + 34, 10, 32, col_d)
-    cv.poly([(x + 150, y + 34), (x + 164, y + 34), (x + 157, y + 26)], col_d)
-    cv.fill_rect(x + 154.5, y + 40, 5, 6, (250, 220, 160))
-    cv.fill_rect(x + 76, y + 36, 34, 30, col)
-    cv.circle(x + 93, y + 36, 17, col)
-    cv.poly([(x + 82, y + 66), (x + 82, y + 48), (x + 93, y + 40),
-             (x + 104, y + 48), (x + 104, y + 66)], (70, 48, 30))
-    for wx, wy in ((14, 50), (26, 54), (46, 46), (124, 48), (138, 54),
-                   (84, 44)):
-        cv.fill_rect(x + wx, y + wy, 3.4, 4.6, (255, 224, 150))
-    cv.line(x + 93, y + 20, x + 93, y + 8, (60, 44, 30), 2.2)
-    cv.fill_rect(x + 93, y + 8, 26, 5.2, (206, 40, 44))
-    cv.fill_rect(x + 93, y + 13.2, 26, 5.2, (246, 246, 246))
-    cv.fill_rect(x + 93, y + 18.4, 26, 5.2, (28, 28, 32))
-    for dx in (7, 12, 17):
-        cv.circle(x + 93 + dx, y + 15.8, 1.3, (40, 150, 80))
-    cv.fill_rect(x, y + 66, 182, 13, (176, 134, 84))
-    cv.ellipse(x + 40, y + 70, 50, 6, (190, 148, 96))
-    cv.ellipse(x + 150, y + 72, 46, 5, (166, 126, 78))
-    for bx, by in ((140, 14), (156, 9), (126, 7)):
-        cv.line(x + bx - 4, y + by, x + bx, y + by - 2.6, (90, 64, 44), 1.5)
-        cv.line(x + bx, y + by - 2.6, x + bx + 4, y + by, (90, 64, 44), 1.5)
-
-
-# --------------------------------------------------------------------------
-# Page composition.
-# --------------------------------------------------------------------------
-
+# ---------------------------------------------------------------- page
 PANELS = [
-    (sc_peace, "RIVALS SIGN PEACE DEAL"),
-    (sc_court, "COURT: MYANMAR GENOCIDE"),
-    (sc_markets, "AI SELL-OFF ROUTS MARKETS"),
-    (sc_ipo, "RECORD IPO STAR SLIDES"),
-    (sc_kerch, "KERCH BRIDGE SPAN DOWN"),
-    (sc_microsoft, "MICROSOFT OUTAGE WORLDWIDE"),
-    (sc_hormuz, "US BLOCKADE CHOKES HORMUZ"),
-    (sc_cop, "COP31 STALLS ON FOSSILS"),
-    (sc_haiti, "HAITI RAID KILLS 34"),
-    (sc_ukeu, "UK-EU RESET DEAL"),
-    (sc_saudi, "SAUDI SHIELD STOPS MISSILES"),
-    (sc_greenland, "GREENLAND SECURITY DEAL"),
-    (sc_vietnam, "VIETNAM CUTS DEATH PENALTY"),
-    (sc_cyber, "TRUMP FIRES CYBER CHIEF"),
-    (sc_iraq, "IRAQ ENTERS MILITIA TOWN"),
+    (scene_peace, ["RIVALS SIGN", "PEACE DEAL"]),
+    (scene_court, ["COURT: MYANMAR", "GENOCIDE"]),
+    (scene_markets, ["AI SELL-OFF", "ROUTS MARKETS"]),
+    (scene_ipo, ["RECORD IPO", "STAR SLIDES"]),
+    (scene_kerch, ["KERCH BRIDGE", "SPAN DOWN"]),
+    (scene_microsoft, ["MICROSOFT OUTAGE", "WORLDWIDE"]),
+    (scene_hormuz, ["US BLOCKADE", "CHOKES HORMUZ"]),
+    (scene_cop31, ["COP31 STALLS", "ON FOSSILS"]),
+    (scene_haiti, ["HAITI RAID", "KILLS 34"]),
+    (scene_ukeu, ["UK-EU RESET DEAL"]),
+    (scene_saudi, ["SAUDI SHIELD", "STOPS MISSILES"]),
+    (scene_greenland, ["GREENLAND", "SECURITY DEAL"]),
+    (scene_vietnam, ["VIETNAM CUTS", "DEATH PENALTY"]),
+    (scene_cyber, ["TRUMP FIRES", "CYBER CHIEF"]),
+    (scene_iraq, ["IRAQ ENTERS", "MILITIA TOWN"]),
 ]
 
-STRIP = [
-    ("AMERICAS", (196, 56, 44),
-     ["BUKELE SEEKS THIRD TERM", "PERU HIT BY 6.7 QUAKE",
-      "COLOMBIA PROTESTS TAXES", "LULA SHIELDS AMAZON",
-      "SHEINBAUM FLIGHT VIRAL", "CANADA DEAL NEEDS WORK",
-      "DATA-CENTRE TAX VOW"]),
-    ("EUROPE", (36, 84, 168),
-     ["GUARANTEES FOR UKRAINE", "NL EMBASSY HIT IN KYIV",
-      "HUNGARY LIFTS EU VETO", "FRANKFURT PLOT ARRESTS",
-      "META FINED EUR 805M", "KHARKIV TOWNS RETAKEN",
-      "DENMARK EXPELS ATTACHE", "CEASEFIRE DRILLS POLAND"]),
-    ("MIDDLE EAST", (196, 138, 30),
-     ["QESHM BLAST: DISPOSAL", "QATAR MEDIATES HORMUZ",
-      "SAUDI STRIKES HODEIDAH", "TEHRAN REJECTS US TERMS"]),
-    ("AFRICA", (36, 140, 80),
-     ["ANGOLA IN DE BEERS DEAL", "BOAT CAPSIZES SENEGAL",
-      "LAST EBOLA CASE OUT"]),
-    ("ASIA-PACIFIC", (128, 62, 168),
-     ["CYCLONE AKVAN TO INDIA", "JAPAN QUAKE INJURES 22",
-      "TSMC TIGHTENS CURBS", "KOREA CHOLERA AFTER 10Y",
-      "NICHOLLS 113 LIFTS NZ", "XAVIER HITS COOK IS.",
-      "JAPAN SUB STUDY FUNDED", "BOMBERS ENTER TW ZONE"]),
+REGIONS = [
+    ("AMERICAS", RED_DK, [
+        "BUKELE SEEKS THIRD TERM",
+        "PERU HIT BY 6.7 QUAKE",
+        "COLOMBIA PROTESTS TAXES",
+        "LULA SHIELDS AMAZON",
+        "SHEINBAUM FLIGHT VIRAL",
+        "CANADA DEAL NEEDS WORK",
+    ]),
+    ("EUROPE", NAVY, [
+        "GUARANTEES FOR UKRAINE",
+        "NL EMBASSY HIT IN KYIV",
+        "HUNGARY LIFTS EU VETO",
+        "FRANKFURT PLOT ARRESTS",
+        "META FINED EUR 805M",
+        "DENMARK EXPELS ATTACHE",
+    ]),
+    ("MIDDLE EAST", GOLD_DK, [
+        "QESHM BLAST: DISPOSAL",
+        "QATAR MEDIATES HORMUZ",
+        "TRUMP DEMANDS REAL DEAL",
+        "SAUDI STRIKES HODEIDAH",
+    ]),
+    ("AFRICA", GREEN_DK, [
+        "ANGOLA IN DE BEERS DEAL",
+        "BOAT CAPSIZES SENEGAL",
+        "LAST EBOLA CASE OUT",
+    ]),
+    ("ASIA-PACIFIC", TEAL_DK, [
+        "CYCLONE AKVAN TO INDIA",
+        "JAPAN QUAKE INJURES 22",
+        "TSMC TIGHTENS CURBS",
+        "KOREA CHOLERA AFTER 10Y",
+        "NICHOLLS 113 LIFTS NZ",
+        "JAPAN SUB STUDY FUNDED",
+    ]),
 ]
 
-
-def panel_label(cv, x, y, w, label):
-    by = y + 85
-    cv.fill_rect(x + 3, by, w - 6, 32, (17, 23, 32))
-    size1 = cv.fit_size(label, w - 16, 15.5)
-    if size1 >= 11.8:
-        cv.text(x + w / 2, by + (32 - size1) / 2, label, size1,
-                (250, 244, 230), align='c')
-        return
-    words = label.split()
-    best = None
-    for i in range(1, len(words)):
-        a, b = " ".join(words[:i]), " ".join(words[i:])
-        score = max(cv.text_w(a, 13.0), cv.text_w(b, 13.0))
-        if best is None or score < best[0]:
-            best = (score, a, b)
-    _, la, lb = best
-    size = min(13.5, (w - 16) / max(cv.text_w(la, 1.0),
-                                    cv.text_w(lb, 1.0)))
-    cv.text(x + w / 2, by + 3.2, la, size, (250, 244, 230), align='c')
-    cv.text(x + w / 2, by + 3.2 + size + 2.8, lb, size, (250, 244, 230),
-            align='c')
+CX = 40                 # content left edge
+CW = 944                # content width
+PANEL_W = 180
+PANEL_GAP = 11
+SCENE_H = 70
+LABEL_H = 40
 
 
-def panel(cv, x, y, w, scene_fn, label):
-    cv.fill_rect(x, y, w, 120, INK)
-    scene_fn(cv, x + 3, y + 3)
-    panel_label(cv, x, y, w, label)
+def draw_panel(cv, x, y, scene_fn, label_lines):
+    cv.set_clip(x, y, PANEL_W, SCENE_H)
+    scene_fn(cv, x, y)
+    cv.reset_clip()
+    ly = y + SCENE_H
+    cv.rect(x, ly, PANEL_W, LABEL_H, NAVY)
+    if len(label_lines) == 1:
+        draw_text_centered(cv, x + PANEL_W // 2, ly + 13, label_lines[0],
+                           2, WHITE, 0, True)
+    else:
+        draw_text_centered(cv, x + PANEL_W // 2, ly + 5, label_lines[0],
+                           2, WHITE, 0, True)
+        draw_text_centered(cv, x + PANEL_W // 2, ly + 22, label_lines[1],
+                           2, WHITE, 0, True)
+    cv.rect_outline(x, y, PANEL_W, SCENE_H + LABEL_H, INK, 2)
 
 
-def compose():
-    cv = Canvas(W, H, SS)
-    cv.fill_rect(0, 0, W, H, PAPER)
-    cv.rect_outline(8, 8, W - 16, H - 16, INK, 3)
-    cv.rect_outline(14, 14, W - 28, H - 28, INK, 1.2)
+def draw_page(cv):
+    cv.rect(0, 0, W, H, PAPER)
+    cv.rect_outline(14, 14, 996, 996, INK, 3)
+    cv.rect_outline(23, 23, 978, 978, INK, 1)
+
     # masthead
-    cv.fill_rect(26, 24, 972, 3, INK)
-    cv.fill_rect(26, 30, 972, 1.2, INK)
-    cv.text(512, 38, "THE WORLD IN ONE DAY", 22, INK, align='c',
-            tracking=1.25)
-    dsize = cv.fit_size("FRIDAY 20 NOVEMBER 2026", 950, 56)
-    cv.text(512, 66, "FRIDAY 20 NOVEMBER 2026", dsize, INK, align='c')
-    cv.text(512, 66 + dsize + 8, "EVERY CONTINENT · EVERY BIG STORY · ONE DAY",
-            14.5, (150, 32, 38), align='c', tracking=1.1)
-    rule_y = 66 + dsize + 8 + 22
-    cv.fill_rect(26, rule_y, 972, 1.2, INK)
-    cv.fill_rect(26, rule_y + 4, 972, 3, INK)
+    draw_text_centered(cv, 512, 38, "THE WORLD IN ONE DAY", 3, INK, 2, True)
+    cv.rect(CX, 70, CW, 2, INK)
+    cv.rect(CX, 75, CW, 1, INK)
+    draw_text_centered(cv, 512, 86, "FRIDAY 20 NOVEMBER 2026", 6, INK, 1, True)
+    draw_text_centered(cv, 512, 140,
+                       "EVERY CONTINENT \u00b7 EVERY BIG STORY \u00b7 ONE DAY",
+                       2, RED, 1, True)
+    cv.rect(CX, 164, CW, 2, INK)
+    cv.rect(CX, 169, CW, 1, INK)
+
     # hero
-    hx, hy, hw, hh = 26, 164, 972, 296
-    cv.fill_rect(hx, hy, hw, hh, INK)
-    sc_hero(cv, hx + 3, hy + 3, hw - 6, hh - 70)
-    by = hy + hh - 64
-    cv.vgrad(hx + 3, by, hw - 6, 61, (146, 18, 28), (198, 42, 46))
-    tsize = cv.fit_size("RUSSIA BOMBARDS UKRAINE", 930, 30)
-    cv.text(512, by + 7, "RUSSIA BOMBARDS UKRAINE", tsize, (255, 246, 230),
-            align='c')
-    fact = "400+ DRONES · 110 MISSILES · KYIV BRIDGES AND POWER GRID HIT · 8 DEAD"
-    fsize = cv.fit_size(fact, 930, 14.5)
-    cv.text(512, by + 7 + tsize + 5, fact, fsize, (255, 214, 170), align='c')
-    # panel grid: 5 columns x 3 rows
-    for idx, (fn, label) in enumerate(PANELS):
-        px = 26 + (idx % 5) * 196
-        py = 468 + (idx // 5) * 128
-        panel(cv, px, py, 188, fn, label)
+    draw_hero(cv, CX, 178, CW, 250)
+    cv.rect(CX, 428, CW, 62, RED)
+    draw_text_centered(cv, 512, 437, "RUSSIA BOMBARDS UKRAINE", 4, WHITE, 1, True)
+    draw_text_centered(cv, 512, 469,
+                       "400+ DRONES \u00b7 110 MISSILES \u00b7 KYIV BRIDGES AND "
+                       "POWER GRID HIT \u00b7 8 DEAD",
+                       2, WHITE, 1, False)
+    cv.rect_outline(CX, 178, CW, 312, INK, 3)
+
+    # story grid
+    gy = 504
+    for row in range(3):
+        for col in range(5):
+            fn, lines = PANELS[row * 5 + col]
+            draw_panel(cv, CX + col * (PANEL_W + PANEL_GAP),
+                       gy + row * (SCENE_H + LABEL_H + 10), fn, lines)
+
     # headlines strip
-    sy = 852
-    cv.text(26, sy, "MORE OF THE DAY", 15, INK)
-    cv.text(998, sy, "REGION BY REGION", 15, (176, 28, 36), align='r')
-    cv.fill_rect(26, sy + 22, 972, 2.4, INK)
-    for i, (name, colr, lines) in enumerate(STRIP):
-        cx = 26 + i * 196
-        cv.fill_rect(cx, sy + 32, 26, 3.4, colr)
-        cv.text(cx, sy + 40, name, 12.5, colr)
-        ly = sy + 60
-        for ln in lines:
-            sz = cv.fit_size(ln, 182, 9.8, condense=0.88)
-            cv.text(cx, ly, ln, sz, (40, 44, 52), condense=0.88)
-            ly += 11.6
-    return cv
+    sy = 868
+    cv.rect(CX, 858, CW, 2, INK)
+    draw_text(cv, CX, sy, "MORE OF THE DAY", 2, INK, 1, True)
+    rw = text_width("REGION BY REGION", 2, 1, True)
+    draw_text(cv, CX + CW - rw, sy, "REGION BY REGION", 2, RED, 1, True)
+    for col, (name, color, lines) in enumerate(REGIONS):
+        rx = CX + col * (PANEL_W + PANEL_GAP)
+        draw_text(cv, rx, 892, name, 1, color, 1, True)
+        cv.rect(rx, 903, PANEL_W, 2, color)
+        for i, line in enumerate(lines):
+            draw_text(cv, rx, 911 + i * 11, line, 1, INK, 1, False)
 
 
 def render_png_bytes():
-    cv = compose()
-    rgb, w, h = cv.downscale()
-    return encode_png(rgb, w, h)
+    cv = Canvas(W, H, PAPER)
+    draw_page(cv)
+    return encode_png(cv)
 
 
 def main():
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(outdir, exist_ok=True)
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, "entry.png")
     try:
         data = render_png_bytes()
     except Exception:
-        here = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(here, "fallback.png"), "rb") as fh:
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "fallback.png")
+        with open(src, "rb") as fh:
             data = fh.read()
-    with open(os.path.join(outdir, "entry.png"), "wb") as fh:
+    with open(target, "wb") as fh:
         fh.write(data)
 
 
