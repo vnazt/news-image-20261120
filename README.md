@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/news-image-20261120/vnazt/news-image-20261120/rank.svg)](https://make.fun/bounty/news-image-20261120/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261120)
 [![reward](https://make.fun/badge/news-image-20261120/vnazt/news-image-20261120/reward.svg)](https://make.fun/bounty/news-image-20261120?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261120)
 
-One image that sums up the world news of Friday 20 November 2026 — a classic illustrated newspaper front page: a giant serif date headline, a numbers strip, region tabs, three hero panels (Russian missiles inside Poland, the worldwide AI market rout, the barrage on Kyiv), ten more pictured stories, a dot-matrix world map, and 22 one-line briefs — 35 stories in all, every one dated Friday 20 November 2026, with a date-check box naming the stories deliberately left out as other days' news.
+One image that sums up the world news of Friday 20 November 2026 — a classic illustrated newspaper front page: a giant serif date headline, a numbers strip whose six figures come from six different stories, region tabs with counts computed from the story list, three hero panels (Russian missiles inside Poland, the worldwide AI market rout, the barrage on Kyiv), ten more pictured stories (including Nicholls' 113 at Wellington), a dot-matrix world map with numbered markers, and 19 one-line briefs that each name a real source — 32 stories in all, every one dated Friday 20 November 2026, with a date-check box naming the stories deliberately left out as other days' news.
 
 ## Run it
 
