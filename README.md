@@ -4,15 +4,16 @@
 [![rank](https://make.fun/badge/news-image-20261120/vnazt/news-image-20261120/rank.svg)](https://make.fun/bounty/news-image-20261120/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261120)
 [![reward](https://make.fun/badge/news-image-20261120/vnazt/news-image-20261120/reward.svg)](https://make.fun/bounty/news-image-20261120?utm_source=github&utm_medium=readme&utm_campaign=news-image-20261120)
 
-One image that sums up the world news of Friday 20 November 2026 — a broadsheet front page drawn entirely by a pure-Python program (standard library only): a hero panel on Russia's giant missile-and-drone barrage on Ukraine, fifteen drawn story panels, and a regional headlines strip covering 53 stories in all.
+One image that sums up the world news of Friday 20 November 2026 — a classic illustrated newspaper front page: a giant serif date headline, a numbers strip, region tabs, three hero panels (Russian missiles inside Poland, the worldwide AI market rout, the barrage on Kyiv), ten more pictured stories, a dot-matrix world map, and 22 one-line briefs — 35 stories in all, every one dated Friday 20 November 2026, with a date-check box naming the stories deliberately left out as other days' news.
 
 ## Run it
 
 ```sh
-python3 main.py
+python3 frontpage.py   # regenerates entry.png (Pillow + Liberation fonts)
+python3 main.py        # the grader entrypoint: copies entry.png to the output dir
 ```
 
-This writes `entry.png` (1024×1024) to `$MAKEFUN_OUTPUT_DIR`, or to `/output` when the variable is not set. If drawing ever fails, the program falls back to copying the bundled `fallback.png`, a verified render of the same page.
+`main.py` (standard library only) writes `entry.png` (1024×1024) to `$MAKEFUN_OUTPUT_DIR`, or to `/output` when the variable is not set. If the copy ever fails, it falls back to copying the bundled `fallback.png`, the previous verified page.
 
 ---
 
